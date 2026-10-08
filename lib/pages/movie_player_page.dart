@@ -925,28 +925,7 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
                               ),
                             ],
                           )
-                        : const Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              SizedBox(
-                                width: 38,
-                                height: 38,
-                                child: CircularProgressIndicator(
-                                  color: Color(0xFF00E676),
-                                  strokeWidth: 3.0,
-                                ),
-                              ),
-                              SizedBox(height: 10),
-                              Text(
-                                "Loading HD Stream...",
-                                style: TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w700,
-                                ),
-                              ),
-                            ],
-                          ),
+                        : const _PlayerPercentageLoader(),
                   ),
                 ),
               ],
@@ -2075,3 +2054,109 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
     );
   }
 }
+
+/// Compact, text-free circular loading indicator that rotates and counts from 1% to 100%
+class _PlayerPercentageLoader extends StatefulWidget {
+  const _PlayerPercentageLoader();
+
+  @override
+  State<_PlayerPercentageLoader> createState() =>
+      _PlayerPercentageLoaderState();
+}
+
+class _PlayerPercentageLoaderState extends State<_PlayerPercentageLoader>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _spinController;
+  Timer? _timer;
+  int _percent = 1;
+
+  @override
+  void initState() {
+    super.initState();
+    _spinController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1000),
+    )..repeat();
+
+    _timer = Timer.periodic(const Duration(milliseconds: 35), (_) {
+      if (!mounted) return;
+      setState(() {
+        if (_percent < 78) {
+          _percent += 2;
+        } else if (_percent < 95) {
+          _percent += 1;
+        } else if (_percent < 99) {
+          _percent = 99;
+        }
+        if (_percent > 100) _percent = 100;
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _spinController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 66,
+      height: 66,
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.68),
+        shape: BoxShape.circle,
+        border: Border.all(
+          color: const Color(0xFF00E676).withValues(alpha: 0.28),
+          width: 1.2,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: const Color(0xFF00E676).withValues(alpha: 0.18),
+            blurRadius: 16,
+            spreadRadius: 1,
+          ),
+        ],
+      ),
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          SizedBox(
+            width: 52,
+            height: 52,
+            child: CircularProgressIndicator(
+              value: _percent / 100.0,
+              strokeWidth: 3.2,
+              backgroundColor: Colors.white.withValues(alpha: 0.12),
+              color: const Color(0xFF00E676),
+            ),
+          ),
+          RotationTransition(
+            turns: _spinController,
+            child: const SizedBox(
+              width: 52,
+              height: 52,
+              child: CircularProgressIndicator(
+                value: 0.22,
+                strokeWidth: 3.2,
+                color: Color(0xFF69F0AE),
+              ),
+            ),
+          ),
+          Text(
+            "$_percent%",
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 12.5,
+              fontWeight: FontWeight.w800,
+              letterSpacing: -0.3,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+

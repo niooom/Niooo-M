@@ -286,6 +286,14 @@ class _NioooCinemaMainScreenState extends State<NioooCinemaMainScreen>
           _activePlayingMovieId = null;
         }
       });
+
+      // Silently pre-warm top featured items in background so C++ direct links are instant on tap
+      for (final item in merged.take(5)) {
+        final target = item.streamtapeId.isNotEmpty
+            ? item.streamtapeId
+            : (item.embedUrl.isNotEmpty ? item.embedUrl : item.id);
+        MovieCatalogData.resolveDirectStreamUrl(target);
+      }
     } else {
       setState(() => _isSyncingCatalog = false);
     }

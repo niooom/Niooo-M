@@ -1,6 +1,7 @@
 import "dart:async";
 import "dart:convert";
 import "dart:io";
+import "dart:math" as math;
 import "package:flutter/material.dart";
 import "package:flutter/services.dart";
 import "package:video_player/video_player.dart";
@@ -77,15 +78,13 @@ class PlatformBridge {
     final trimmed = rawUrlOrId.trim();
     if (trimmed.isEmpty) return "";
 
-    // 1. Try Ultra-Fast Native C++17 File ID Extractor first
     final cppId = NativeCppEngine.extractFileIdWithCpp(trimmed);
     if (cppId != null && cppId.isNotEmpty) {
       return cppId;
     }
 
-    // 2. Fallback Dart Regex
     final match = RegExp(
-      r"streamtape\.com/(?:e|v)/([a-zA-Z0-9_-]+)",
+      r"streamtape\.[a-z]+/(?:e|v)/([a-zA-Z0-9_-]+)",
       caseSensitive: false,
     ).firstMatch(trimmed);
     if (match != null && match.group(1) != null) {
@@ -112,8 +111,9 @@ class PlatformBridge {
     return null;
   }
 
-  /// Extracts the direct MP4 video stream link in the background on Android
-  /// using the Native C++17 Zero-Copy Engine + parallel race fallback.
+  /// Extracts the direct MP4 video stream link directly on the user's Android device
+  /// using the Native C++17 Zero-Copy Engine so the Streamtape IP token 100% matches
+  /// the user's phone IP and never gets blocked (403 Forbidden)!
   static Future<String?> resolveBackgroundDirectMp4Url(
     String fileOrStreamUrl,
   ) async {
@@ -130,7 +130,7 @@ class PlatformBridge {
       return existingInFlight;
     }
 
-    final future = _performFastExtraction(cleanId);
+    final future = _performDeviceNativeExtraction(cleanId);
     _inFlightExtractions[cleanId] = future;
     try {
       return await future;
@@ -139,62 +139,54 @@ class PlatformBridge {
     }
   }
 
-  static Future<String?> _performFastExtraction(String cleanId) async {
+  static Future<String?> _performDeviceNativeExtraction(String cleanId) async {
     NativeCppEngine.boostPlaybackPriority(highPriority: true);
 
-    final completer = Completer<String?>();
-    int remaining = 2;
-
-    void handleCandidate(String? candidate) {
-      if (candidate != null &&
-          candidate.startsWith("http") &&
-          !candidate.contains("/e/")) {
-        _cacheDirectUrl(cleanId, candidate);
-        if (!completer.isCompleted) {
-          completer.complete(candidate);
-        }
-        return;
-      }
-      remaining--;
-      if (remaining <= 0 && !completer.isCompleted) {
-        completer.complete(null);
-      }
+    // 1. Primary: Extract directly from user's phone IP via `/e/{id}` + C++17 Engine
+    final fromEmbed = await _extractFromDeviceEndpoint(
+      cleanId,
+      "https://streamtape.com/e/${Uri.encodeComponent(cleanId)}",
+    );
+    if (fromEmbed != null && fromEmbed.startsWith("http")) {
+      _cacheDirectUrl(cleanId, fromEmbed);
+      return fromEmbed;
     }
 
-    // Racer 1: Direct Streamtape HTML fetch + Native C++17 (-O3) zero-copy token extraction
-    _extractViaNativeCppAndStreamtape(cleanId)
-        .then(handleCandidate)
-        .catchError((_) => handleCandidate(null));
+    // 2. Secondary: Try `/v/{id}` directly from user's phone IP + C++17 Engine
+    final fromVideoPage = await _extractFromDeviceEndpoint(
+      cleanId,
+      "https://streamtape.com/v/${Uri.encodeComponent(cleanId)}",
+    );
+    if (fromVideoPage != null && fromVideoPage.startsWith("http")) {
+      _cacheDirectUrl(cleanId, fromVideoPage);
+      return fromVideoPage;
+    }
 
-    // Racer 2: Cloud Server Direct Endpoint (runs in parallel so whichever finishes first wins!)
-    _extractViaCloudServer(cleanId)
-        .then(handleCandidate)
-        .catchError((_) => handleCandidate(null));
-
-    return completer.future;
+    return null;
   }
 
-  static Future<String?> _extractViaNativeCppAndStreamtape(
+  static Future<String?> _extractFromDeviceEndpoint(
     String cleanId,
+    String pageUrl,
   ) async {
     try {
       final client = _getFastHttpClient();
-      final req = await client.getUrl(
-        Uri.parse("https://streamtape.com/e/${Uri.encodeComponent(cleanId)}"),
-      );
+      final req = await client.getUrl(Uri.parse(pageUrl));
+      req.headers.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+      req.headers.set("Referer", "https://streamtape.com/");
       final res = await req.close();
       if (res.statusCode != 200) return null;
 
       final html = await res.transform(utf8.decoder).join();
 
-      // 1. Primary: Native C++17 Zero-Copy Extractor (`libniooom_native_engine.so`)
+      // 1. Native C++17 Zero-Copy Extractor (`libniooom_native_engine.so`)
       String? extractedGetVideoUrl =
           NativeCppEngine.extractStreamtapeUrlWithCpp(html);
 
-      // 2. Fallback: Dart Regex if Native C++ library did not match a new variant
+      // 2. Fallback Dart Regex supporting all robotlink/botlink/ideoolink/norobotlink split patterns
       if (extractedGetVideoUrl == null || extractedGetVideoUrl.isEmpty) {
         final regex = RegExp(
-          r"""getElementById\(['"]robotlink['"]\)\.innerHTML\s*=\s*['"]([^'"]+)['"]\s*\+\s*(?:''\s*\+\s*)?\(['"]([^'"]+)['"]\)((?:\.substring\(\d+\))+)""",
+          r"""getElementById\(['"](?:robotlink|botlink|ideoolink|norobotlink)['"]\)\.innerHTML\s*=\s*['"]([^'"]*)['"]\s*\+\s*(?:['"]['"]\s*\+\s*)?\(['"]([^'"]+)['"]\)((?:\.substring\(\d+\))+)""",
         );
         final matches = regex.allMatches(html);
         for (final match in matches) {
@@ -209,12 +201,14 @@ class PlatformBridge {
             }
           }
           final combined = "$prefix$suffix";
-          if (combined.startsWith("//")) {
-            extractedGetVideoUrl = "https:$combined&stream=1";
-          } else if (combined.startsWith("/")) {
-            extractedGetVideoUrl = "https:/$combined&stream=1";
-          } else {
-            extractedGetVideoUrl = "https://$combined&stream=1";
+          if (combined.contains("get_video?") && combined.contains("token=")) {
+            if (combined.startsWith("//")) {
+              extractedGetVideoUrl = "https:$combined&stream=1";
+            } else if (combined.startsWith("/")) {
+              extractedGetVideoUrl = "https:/$combined&stream=1";
+            } else {
+              extractedGetVideoUrl = "https://$combined&stream=1";
+            }
           }
         }
       }
@@ -224,6 +218,7 @@ class PlatformBridge {
           final redirectReq =
               await client.getUrl(Uri.parse(extractedGetVideoUrl));
           redirectReq.followRedirects = false;
+          redirectReq.headers.set("Referer", pageUrl);
           final redirectRes = await redirectReq.close();
           final location =
               redirectRes.headers.value(HttpHeaders.locationHeader);
@@ -232,31 +227,6 @@ class PlatformBridge {
           }
         } catch (_) {}
         return extractedGetVideoUrl;
-      }
-    } catch (_) {}
-    return null;
-  }
-
-  static Future<String?> _extractViaCloudServer(String cleanId) async {
-    try {
-      final client = _getFastHttpClient();
-      final req = await client.getUrl(
-        Uri.parse(
-          "$cloudServerBaseUrl/api/streamtape/direct?file=${Uri.encodeComponent(cleanId)}",
-        ),
-      );
-      final res = await req.close();
-      if (res.statusCode == 200) {
-        final body = await res.transform(utf8.decoder).join();
-        if (body.trim().startsWith("{")) {
-          final decoded = jsonDecode(body);
-          if (decoded is Map<String, dynamic>) {
-            final url = (decoded["url"] ?? "").toString();
-            if (url.startsWith("http") && !url.contains("/e/")) {
-              return url;
-            }
-          }
-        }
       }
     } catch (_) {}
     return null;
@@ -333,6 +303,7 @@ class PlatformBridge {
       httpHeaders: const {
         "User-Agent":
             "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+        "Referer": "https://streamtape.com/",
         "Connection": "keep-alive",
       },
       videoPlayerOptions: VideoPlayerOptions(
@@ -482,23 +453,50 @@ class PlatformBridge {
       return ValueListenableBuilder<VideoPlayerValue>(
         valueListenable: videoObj,
         builder: (context, value, _) {
-          if (!value.isInitialized) {
-            return _buildLoadingBackdrop(backdropUrl);
-          }
+          final bool isReady = value.isInitialized;
+          final bool isStalledOrBuffering = !isReady ||
+              value.isBuffering ||
+              (value.isPlaying &&
+                  value.duration.inMilliseconds > 0 &&
+                  value.position.inMilliseconds == 0);
+
           return RepaintBoundary(
-            child: Container(
-              color: Colors.black,
-              alignment: Alignment.center,
-              child: AspectRatio(
-                aspectRatio: value.aspectRatio > 0 ? value.aspectRatio : 16 / 9,
-                child: VideoPlayer(videoObj),
-              ),
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                if (isReady)
+                  Container(
+                    color: Colors.black,
+                    alignment: Alignment.center,
+                    child: AspectRatio(
+                      aspectRatio:
+                          value.aspectRatio > 0 ? value.aspectRatio : 16 / 9,
+                      child: VideoPlayer(videoObj),
+                    ),
+                  )
+                else
+                  _buildLoadingBackdrop(backdropUrl),
+
+                // Show clean 1%–100% circular loader whenever initializing or buffering due to slow network
+                if (isStalledOrBuffering)
+                  const Center(
+                    child: _CleanPercentageLoader(),
+                  ),
+              ],
             ),
           );
         },
       );
     }
-    return _buildLoadingBackdrop(backdropUrl);
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        _buildLoadingBackdrop(backdropUrl),
+        const Center(
+          child: _CleanPercentageLoader(),
+        ),
+      ],
+    );
   }
 
   static Widget _buildLoadingBackdrop(String backdropUrl) {
@@ -532,4 +530,123 @@ class PlatformBridge {
       videoObj.seekTo(pos);
     }
   }
+}
+
+/// Compact, text-free circular loading animation that counts smoothly from 1% to 100%
+/// inside the video player while loading or buffering.
+class _CleanPercentageLoader extends StatefulWidget {
+  const _CleanPercentageLoader();
+
+  @override
+  State<_CleanPercentageLoader> createState() => _CleanPercentageLoaderState();
+}
+
+class _CleanPercentageLoaderState extends State<_CleanPercentageLoader>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _spinController;
+  Timer? _percentTimer;
+  int _percent = 1;
+
+  @override
+  void initState() {
+    super.initState();
+    _spinController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1100),
+    )..repeat();
+
+    _percentTimer = Timer.periodic(const Duration(milliseconds: 35), (timer) {
+      if (!mounted) return;
+      setState(() {
+        if (_percent < 75) {
+          _percent += 2;
+        } else if (_percent < 95) {
+          _percent += 1;
+        } else if (_percent < 99) {
+          _percent = 99;
+        }
+        if (_percent > 100) _percent = 100;
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _percentTimer?.cancel();
+    _spinController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 66,
+      height: 66,
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.68),
+        shape: BoxShape.circle,
+        border: Border.all(
+          color: const Color(0xFF00E676).withValues(alpha: 0.28),
+          width: 1.2,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: const Color(0xFF00E676).withValues(alpha: 0.18),
+            blurRadius: 16,
+            spreadRadius: 1,
+          ),
+        ],
+      ),
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          SizedBox(
+            width: 52,
+            height: 52,
+            child: CircularProgressIndicator(
+              value: _percent / 100.0,
+              strokeWidth: 3.2,
+              backgroundColor: Colors.white.withValues(alpha: 0.12),
+              color: const Color(0xFF00E676),
+            ),
+          ),
+          RotationTransition(
+            turns: _spinController,
+            child: SizedBox(
+              width: 52,
+              height: 52,
+              child: CustomPaint(
+                painter: _ArcGlowPainter(),
+              ),
+            ),
+          ),
+          Text(
+            "$_percent%",
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 12.5,
+              fontWeight: FontWeight.w800,
+              letterSpacing: -0.3,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ArcGlowPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final rect = Offset.zero & size;
+    final paint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 3.2
+      ..strokeCap = StrokeCap.round
+      ..color = const Color(0xFF69F0AE);
+    canvas.drawArc(rect, 0, math.pi * 0.45, false, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }

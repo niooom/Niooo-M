@@ -18,7 +18,7 @@ namespace {
 std::mutex g_cache_mutex;
 std::unordered_map<std::string, std::string> g_direct_url_cache;
 
-// Ultra-fast helper to parse chained .substring(N) calls in Streamtape JS tokens
+// Ultra-fast helper to sum all chained .substring(N) calls in Streamtape JS tokens
 inline size_t parse_chained_substrings(std::string_view expr) {
     size_t total_skip = 0;
     size_t pos = 0;
@@ -41,7 +41,18 @@ inline size_t parse_chained_substrings(std::string_view expr) {
 
 // Normalizes a raw Streamtape get_video path into a full HTTPS stream URL
 inline std::string normalize_streamtape_url(std::string_view combined) {
+    while (!combined.empty() &&
+           (combined.front() == ' ' || combined.front() == '\t' ||
+            combined.front() == '\n' || combined.front() == '\r')) {
+        combined.remove_prefix(1);
+    }
+    while (!combined.empty() &&
+           (combined.back() == ' ' || combined.back() == '\t' ||
+            combined.back() == '\n' || combined.back() == '\r')) {
+        combined.remove_suffix(1);
+    }
     if (combined.empty()) return {};
+
     std::string out;
     out.reserve(combined.size() + 24);
     if (combined.rfind("https://", 0) == 0 || combined.rfind("http://", 0) == 0) {
@@ -62,14 +73,54 @@ inline std::string normalize_streamtape_url(std::string_view combined) {
     return out;
 }
 
-// Zero-copy C++17 scanner that extracts the latest valid robotlink / ideoolink / norobotlink token
-std::string extract_streamtape_token_fast(std::string_view html) {
-    std::string best_candidate;
+// Evaluates a single JS assignment right-hand-side expression such as:
+// '//st' + ('xcdreamtape.com/get_video?id=...').substring(2).substring(1)
+// or "/streamtape.c" + '' + ('xcdbom/get_video?id=...').substring(1).substring(2)
+std::string evaluate_js_concat_statement(std::string_view stmt) {
+    size_t q1_start = stmt.find_first_of("'\"");
+    if (q1_start == std::string_view::npos) return {};
+    char q1_char = stmt[q1_start];
+    size_t q1_end = stmt.find(q1_char, q1_start + 1);
+    if (q1_end == std::string_view::npos) return {};
 
-    // Pattern 1: Scan all getElementById('robotlink').innerHTML = 'prefix' + ... ('suffix').substring(N)
+    std::string_view prefix = stmt.substr(q1_start + 1, q1_end - q1_start - 1);
+
+    // Locate parenthesized string ('...') or ("...")
+    size_t paren_pos = stmt.find('(', q1_end + 1);
+    while (paren_pos != std::string_view::npos && paren_pos + 2 < stmt.size()) {
+        size_t q2_start = stmt.find_first_of("'\"", paren_pos + 1);
+        if (q2_start == std::string_view::npos) break;
+        char q2_char = stmt[q2_start];
+        size_t q2_end = stmt.find(q2_char, q2_start + 1);
+        if (q2_end == std::string_view::npos) break;
+
+        std::string_view raw_suffix = stmt.substr(q2_start + 1, q2_end - q2_start - 1);
+        std::string_view tail = stmt.substr(q2_end + 1);
+        size_t skip = parse_chained_substrings(tail);
+
+        if (skip < raw_suffix.size()) {
+            std::string combined;
+            combined.reserve(prefix.size() + (raw_suffix.size() - skip));
+            combined.append(prefix.data(), prefix.size());
+            combined.append(raw_suffix.data() + skip, raw_suffix.size() - skip);
+            if (combined.find("get_video?") != std::string::npos &&
+                combined.find("token=") != std::string::npos) {
+                return normalize_streamtape_url(combined);
+            }
+        }
+        paren_pos = stmt.find('(', q2_end + 1);
+    }
+    return {};
+}
+
+// Zero-copy C++17 scanner that extracts the latest valid robotlink / botlink / ideoolink token
+std::string extract_streamtape_token_fast(std::string_view html) {
+    // Priority order: robotlink first (final live token), then botlink, then norobotlink, then ideoolink
     constexpr std::string_view kRobotMarkers[] = {
         "getElementById('robotlink').innerHTML",
         "getElementById(\"robotlink\").innerHTML",
+        "getElementById('botlink').innerHTML",
+        "getElementById(\"botlink\").innerHTML",
         "getElementById('norobotlink').innerHTML",
         "getElementById(\"norobotlink\").innerHTML",
         "getElementById('ideoolink').innerHTML",
@@ -77,74 +128,29 @@ std::string extract_streamtape_token_fast(std::string_view html) {
     };
 
     for (std::string_view marker : kRobotMarkers) {
+        std::string last_valid_for_marker;
         size_t search_pos = 0;
         while ((search_pos = html.find(marker, search_pos)) != std::string_view::npos) {
             size_t line_start = search_pos + marker.size();
             size_t semi_pos = html.find(';', line_start);
-            if (semi_pos == std::string_view::npos || (semi_pos - line_start) > 1024) {
-                semi_pos = std::min(html.size(), line_start + 512);
+            size_t newline_pos = html.find('\n', line_start);
+            size_t end_pos = semi_pos;
+            if (newline_pos != std::string_view::npos && (end_pos == std::string_view::npos || newline_pos < end_pos)) {
+                end_pos = newline_pos;
             }
-            std::string_view stmt = html.substr(line_start, semi_pos - line_start);
-
-            // Extract first quoted string (prefix)
-            size_t q1_start = stmt.find_first_of("'\"");
-            if (q1_start != std::string_view::npos) {
-                char q1_char = stmt[q1_start];
-                size_t q1_end = stmt.find(q1_char, q1_start + 1);
-                if (q1_end != std::string_view::npos) {
-                    std::string_view prefix = stmt.substr(q1_start + 1, q1_end - q1_start - 1);
-
-                    // Find the parenthesized token string: ('...') or ("...")
-                    size_t paren_pos = stmt.find('(', q1_end + 1);
-                    while (paren_pos != std::string_view::npos && paren_pos + 2 < stmt.size()) {
-                        size_t q2_start = stmt.find_first_of("'\"", paren_pos + 1);
-                        if (q2_start == std::string_view::npos) break;
-                        char q2_char = stmt[q2_start];
-                        size_t q2_end = stmt.find(q2_char, q2_start + 1);
-                        if (q2_end == std::string_view::npos) break;
-
-                        std::string_view raw_suffix = stmt.substr(q2_start + 1, q2_end - q2_start - 1);
-                        if (raw_suffix.find("get_video") != std::string_view::npos ||
-                            prefix.find("streamtape") != std::string_view::npos ||
-                            raw_suffix.find("id=") != std::string_view::npos) {
-                            std::string_view tail = stmt.substr(q2_end + 1);
-                            size_t skip = parse_chained_substrings(tail);
-                            if (skip < raw_suffix.size()) {
-                                std::string combined;
-                                combined.reserve(prefix.size() + (raw_suffix.size() - skip));
-                                combined.append(prefix.data(), prefix.size());
-                                combined.append(raw_suffix.data() + skip, raw_suffix.size() - skip);
-                                if (combined.find("get_video") != std::string::npos) {
-                                    best_candidate = normalize_streamtape_url(combined);
-                                }
-                            }
-                            break;
-                        }
-                        paren_pos = stmt.find('(', q2_end + 1);
-                    }
-                }
+            if (end_pos == std::string_view::npos || (end_pos - line_start) > 1024) {
+                end_pos = std::min(html.size(), line_start + 512);
             }
-            search_pos = semi_pos;
+
+            std::string_view stmt = html.substr(line_start, end_pos - line_start);
+            std::string candidate = evaluate_js_concat_statement(stmt);
+            if (!candidate.empty()) {
+                last_valid_for_marker = std::move(candidate);
+            }
+            search_pos = end_pos;
         }
-    }
-
-    if (!best_candidate.empty()) {
-        return best_candidate;
-    }
-
-    // Pattern 2: Fallback direct scan for <div id="robotlink">...get_video?...</div>
-    size_t div_pos = html.find("id=\"robotlink\"");
-    if (div_pos == std::string_view::npos) {
-        div_pos = html.find("id='robotlink'");
-    }
-    if (div_pos != std::string_view::npos) {
-        size_t gt_pos = html.find('>', div_pos);
-        size_t lt_pos = (gt_pos != std::string_view::npos) ? html.find('<', gt_pos + 1) : std::string_view::npos;
-        if (gt_pos != std::string_view::npos && lt_pos != std::string_view::npos && lt_pos > gt_pos + 1) {
-            std::string_view inner = html.substr(gt_pos + 1, lt_pos - gt_pos - 1);
-            if (inner.find("get_video") != std::string_view::npos) {
-                return normalize_streamtape_url(inner);
-            }
+        if (!last_valid_for_marker.empty()) {
+            return last_valid_for_marker;
         }
     }
 
@@ -189,7 +195,9 @@ char* niooom_extract_file_id(const char* raw_input) {
         "streamtape.com/e/",
         "streamtape.com/v/",
         "streamtape.to/e/",
-        "streamtape.to/v/"
+        "streamtape.to/v/",
+        "strcloud.in/e/",
+        "strcloud.in/v/"
     };
 
     for (std::string_view marker : kMarkers) {
