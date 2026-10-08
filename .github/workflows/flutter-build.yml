@@ -97,9 +97,8 @@ jobs:
 
       - name: Ensure Android Platform Scaffold, Chrome Custom Tabs & File Picker Permissions
         run: |
-          if [ ! -f "android/gradlew" ]; then
-            flutter create --platforms=android --org com.niooo.m --project-name flutter_live_app .
-          fi
+          rm -rf android
+          flutter create --platforms=android --org com.niooo.m --project-name flutter_live_app .
 
           # Configure AndroidManifest.xml with:
           # 1. File Manager / File Picker permissions & WAKE_LOCK / Fullscreen permissions
