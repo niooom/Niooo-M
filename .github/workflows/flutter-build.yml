@@ -99,6 +99,12 @@ jobs:
         run: |
           rm -rf android
           flutter create --platforms=android --org com.niooo.m --project-name flutter_live_app .
+          if [ -f android/settings.gradle.kts ]; then
+            sed -i 's/id("org.jetbrains.kotlin.android") version "[^"]*"/id("org.jetbrains.kotlin.android") version "2.1.0"/g' android/settings.gradle.kts
+          fi
+          if [ -f android/settings.gradle ]; then
+            sed -i 's/id "org.jetbrains.kotlin.android" version "[^"]*"/id "org.jetbrains.kotlin.android" version "2.1.0"/g' android/settings.gradle
+          fi
 
           # Configure AndroidManifest.xml with:
           # 1. File Manager / File Picker permissions & WAKE_LOCK / Fullscreen permissions
