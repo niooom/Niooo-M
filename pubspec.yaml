@@ -1,0 +1,21 @@
+name: flutter_live_app
+description: "Niooo M — Streamtape Cinema & Android Release App"
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.2.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  flutter_custom_tabs: ^2.1.0
+  url_launcher: ^6.3.1
+  webview_flutter: ^4.10.0
+  video_player: ^2.9.2
+  wakelock_plus: ^1.2.10
+
+flutter:
+  uses-material-design: true
+
