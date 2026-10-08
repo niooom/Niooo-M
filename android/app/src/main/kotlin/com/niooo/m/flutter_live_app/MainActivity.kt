@@ -14,12 +14,37 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : FlutterActivity() {
     private val CHANNEL = "com.niooo.m/player"
 
+    companion object {
+        init {
+            try {
+                System.loadLibrary("niooom_native_engine")
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private external fun initNativeCppEngine(): String
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        try {
+            initNativeCppEngine()
+        } catch (_: Throwable) {
+        }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        window.setFlags(
+            WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+            WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
+        )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             window.attributes.layoutInDisplayCutoutMode =
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                window.attributes.preferredDisplayModeId = 0
+            } catch (_: Throwable) {
+            }
         }
     }
 
@@ -55,6 +80,14 @@ class MainActivity : FlutterActivity() {
                             }
                         }
                         result.success(true)
+                    }
+                    "boostPlayback" -> {
+                        try {
+                            val status = initNativeCppEngine()
+                            result.success(status)
+                        } catch (_: Throwable) {
+                            result.success("Fallback Mode")
+                        }
                     }
                     else -> result.notImplemented()
                 }

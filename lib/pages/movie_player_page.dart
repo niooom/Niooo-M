@@ -188,6 +188,18 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
           _hasStreamError = false;
         });
         _switchToDirectPlayer();
+
+        // Silently pre-extract next episode / recommended movie in background with C++ engine
+        final candidates = widget.allMovies
+            .where((m) => m.id != movie.id)
+            .take(2)
+            .toList();
+        for (final nextItem in candidates) {
+          final nextTarget = nextItem.streamtapeId.isNotEmpty
+              ? nextItem.streamtapeId
+              : (nextItem.embedUrl.isNotEmpty ? nextItem.embedUrl : nextItem.id);
+          MovieCatalogData.resolveDirectStreamUrl(nextTarget);
+        }
       } else {
         // If on Web and direct link fails, automatically fall back to Streamtape Frame
         if (PlatformBridge.isWeb) {
@@ -854,35 +866,6 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
                                       ),
                                     ),
                                   ),
-                                  const SizedBox(width: 6),
-                                  GestureDetector(
-                                    behavior: HitTestBehavior.opaque,
-                                    onTap: _toggleFullscreen,
-                                    child: Container(
-                                      padding: const EdgeInsets.all(7),
-                                      decoration: BoxDecoration(
-                                        color: _isFullscreen
-                                            ? const Color(0xFF00E676)
-                                                .withValues(alpha: 0.25)
-                                            : Colors.black
-                                                .withValues(alpha: 0.45),
-                                        borderRadius: BorderRadius.circular(9),
-                                        border: Border.all(
-                                          color: const Color(0xFF00E676)
-                                              .withValues(alpha: 0.45),
-                                        ),
-                                      ),
-                                      child: Icon(
-                                        _isFullscreen
-                                            ? Icons.fullscreen_exit_rounded
-                                            : Icons.fullscreen_rounded,
-                                        color: _isFullscreen
-                                            ? const Color(0xFF00E676)
-                                            : Colors.white,
-                                        size: 24,
-                                      ),
-                                    ),
-                                  ),
                                 ],
                               ),
                             ),
@@ -969,7 +952,7 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
               ],
             ),
 
-          // Top-Left: Clean Minimize / Exit Fullscreen / Back button
+          // Top-Left: Clean Minimize / Back button
           Positioned(
             top: 10,
             left: 12,
@@ -988,10 +971,8 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
                         color: Colors.white.withValues(alpha: 0.25),
                       ),
                     ),
-                    child: Icon(
-                      _isFullscreen
-                          ? Icons.fullscreen_exit_rounded
-                          : Icons.keyboard_arrow_down_rounded,
+                    child: const Icon(
+                      Icons.keyboard_arrow_down_rounded,
                       color: Colors.white,
                       size: 24,
                     ),
@@ -1001,69 +982,34 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
             ),
           ),
 
-          // Top-Right: Clean Settings + Fullscreen Icons
+          // Top-Right: Clean Settings Icon Only (Single Full Screen button is in the Mode Bar below)
           Positioned(
             top: 10,
             right: 12,
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (!PlatformBridge.isWeb || !_useEmbedFrame) ...[
-                  GestureDetector(
-                    onTap: _toggleFullscreen,
-                    child: ClipOval(
-                      child: BackdropFilter(
-                        filter: ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12),
-                        child: Container(
-                          width: 36,
-                          height: 36,
-                          decoration: BoxDecoration(
-                            color: Colors.black.withValues(alpha: 0.62),
-                            shape: BoxShape.circle,
-                            border: Border.all(
-                              color: const Color(0xFF00E676)
-                                  .withValues(alpha: 0.45),
-                            ),
-                          ),
-                          child: Icon(
-                            _isFullscreen
-                                ? Icons.fullscreen_exit_rounded
-                                : Icons.fullscreen_rounded,
-                            color: const Color(0xFF00E676),
-                            size: 21,
-                          ),
-                        ),
+            child: GestureDetector(
+              onTap: _openDualAudioSettingsSheet,
+              child: ClipOval(
+                child: BackdropFilter(
+                  filter: ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+                  child: Container(
+                    width: 36,
+                    height: 36,
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.62),
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                        color: const Color(0xFF00E676)
+                            .withValues(alpha: 0.45),
                       ),
                     ),
-                  ),
-                  const SizedBox(width: 8),
-                ],
-                GestureDetector(
-                  onTap: _openDualAudioSettingsSheet,
-                  child: ClipOval(
-                    child: BackdropFilter(
-                      filter: ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12),
-                      child: Container(
-                        width: 36,
-                        height: 36,
-                        decoration: BoxDecoration(
-                          color: Colors.black.withValues(alpha: 0.62),
-                          shape: BoxShape.circle,
-                          border: Border.all(
-                            color: const Color(0xFF00E676)
-                                .withValues(alpha: 0.45),
-                          ),
-                        ),
-                        child: const Icon(
-                          Icons.settings_rounded,
-                          color: Colors.white,
-                          size: 20,
-                        ),
-                      ),
+                    child: const Icon(
+                      Icons.settings_rounded,
+                      color: Colors.white,
+                      size: 20,
                     ),
                   ),
                 ),
-              ],
+              ),
             ),
           ),
         ],

@@ -1,9 +1,11 @@
+import "dart:async";
 import "dart:convert";
 import "dart:io";
 import "package:flutter/material.dart";
 import "package:flutter/services.dart";
 import "package:video_player/video_player.dart";
 import "package:wakelock_plus/wakelock_plus.dart";
+import "native_cpp_engine.dart";
 
 class PlatformBridge {
   static bool get isWeb => false;
@@ -13,6 +15,22 @@ class PlatformBridge {
 
   static final Map<String, String> _memoryStorage = {};
   static final Map<String, String> _directUrlCache = {};
+  static final Map<String, Future<String?>> _inFlightExtractions = {};
+
+  static HttpClient? _sharedHttpClient;
+
+  static HttpClient _getFastHttpClient() {
+    if (_sharedHttpClient != null) return _sharedHttpClient!;
+    final client = HttpClient();
+    client.connectionTimeout = const Duration(seconds: 7);
+    client.idleTimeout = const Duration(seconds: 30);
+    client.maxConnectionsPerHost = 12;
+    client.autoUncompress = true;
+    client.userAgent =
+        "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
+    _sharedHttpClient = client;
+    return client;
+  }
 
   static String _resolveUrl(String url) {
     if (url.startsWith("http://") || url.startsWith("https://")) {
@@ -41,28 +59,31 @@ class PlatformBridge {
     }
 
     final fullUrl = _resolveUrl(url);
-    final client = HttpClient();
-    client.connectionTimeout = const Duration(seconds: 12);
-    try {
-      final req = await client.getUrl(Uri.parse(fullUrl));
-      if (headers != null) {
-        headers.forEach((k, v) {
-          req.headers.set(k, v);
-        });
-      }
-      final res = await req.close();
-      if (res.statusCode >= 200 && res.statusCode < 300) {
-        return await res.transform(utf8.decoder).join();
-      }
-      throw Exception("HTTP ${res.statusCode} for $fullUrl");
-    } finally {
-      client.close();
+    final client = _getFastHttpClient();
+    final req = await client.getUrl(Uri.parse(fullUrl));
+    if (headers != null) {
+      headers.forEach((k, v) {
+        req.headers.set(k, v);
+      });
     }
+    final res = await req.close();
+    if (res.statusCode >= 200 && res.statusCode < 300) {
+      return await res.transform(utf8.decoder).join();
+    }
+    throw Exception("HTTP ${res.statusCode} for $fullUrl");
   }
 
   static String _extractStreamtapeFileId(String rawUrlOrId) {
     final trimmed = rawUrlOrId.trim();
     if (trimmed.isEmpty) return "";
+
+    // 1. Try Ultra-Fast Native C++17 File ID Extractor first
+    final cppId = NativeCppEngine.extractFileIdWithCpp(trimmed);
+    if (cppId != null && cppId.isNotEmpty) {
+      return cppId;
+    }
+
+    // 2. Fallback Dart Regex
     final match = RegExp(
       r"streamtape\.com/(?:e|v)/([a-zA-Z0-9_-]+)",
       caseSensitive: false,
@@ -73,109 +94,171 @@ class PlatformBridge {
     return trimmed.replaceAll(RegExp(r"[^a-zA-Z0-9_-]"), "");
   }
 
+  static void _cacheDirectUrl(String cleanId, String directUrl) {
+    _directUrlCache[cleanId] = directUrl;
+    NativeCppEngine.setCachedDirectUrl(cleanId, directUrl);
+  }
+
+  static String? _getCachedDirectUrl(String cleanId) {
+    final dartCached = _directUrlCache[cleanId];
+    if (dartCached != null && dartCached.isNotEmpty) {
+      return dartCached;
+    }
+    final cppCached = NativeCppEngine.getCachedDirectUrl(cleanId);
+    if (cppCached != null && cppCached.isNotEmpty) {
+      _directUrlCache[cleanId] = cppCached;
+      return cppCached;
+    }
+    return null;
+  }
+
   /// Extracts the direct MP4 video stream link in the background on Android
-  /// from the video's `stream_url` or `download_url` so it plays in the native player!
+  /// using the Native C++17 Zero-Copy Engine + parallel race fallback.
   static Future<String?> resolveBackgroundDirectMp4Url(
     String fileOrStreamUrl,
   ) async {
     final cleanId = _extractStreamtapeFileId(fileOrStreamUrl);
     if (cleanId.isEmpty) return null;
 
-    if (_directUrlCache.containsKey(cleanId)) {
-      return _directUrlCache[cleanId];
+    final cached = _getCachedDirectUrl(cleanId);
+    if (cached != null) {
+      return cached;
     }
 
-    // Method 1: Background extraction from Streamtape embed page (#robotlink token)
+    final existingInFlight = _inFlightExtractions[cleanId];
+    if (existingInFlight != null) {
+      return existingInFlight;
+    }
+
+    final future = _performFastExtraction(cleanId);
+    _inFlightExtractions[cleanId] = future;
     try {
-      final client = HttpClient();
-      client.connectionTimeout = const Duration(seconds: 8);
-      client.userAgent =
-          "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
-      try {
-        final req = await client.getUrl(
-          Uri.parse("https://streamtape.com/e/${Uri.encodeComponent(cleanId)}"),
+      return await future;
+    } finally {
+      _inFlightExtractions.remove(cleanId);
+    }
+  }
+
+  static Future<String?> _performFastExtraction(String cleanId) async {
+    NativeCppEngine.boostPlaybackPriority(highPriority: true);
+
+    final completer = Completer<String?>();
+    int remaining = 2;
+
+    void handleCandidate(String? candidate) {
+      if (candidate != null &&
+          candidate.startsWith("http") &&
+          !candidate.contains("/e/")) {
+        _cacheDirectUrl(cleanId, candidate);
+        if (!completer.isCompleted) {
+          completer.complete(candidate);
+        }
+        return;
+      }
+      remaining--;
+      if (remaining <= 0 && !completer.isCompleted) {
+        completer.complete(null);
+      }
+    }
+
+    // Racer 1: Direct Streamtape HTML fetch + Native C++17 (-O3) zero-copy token extraction
+    _extractViaNativeCppAndStreamtape(cleanId)
+        .then(handleCandidate)
+        .catchError((_) => handleCandidate(null));
+
+    // Racer 2: Cloud Server Direct Endpoint (runs in parallel so whichever finishes first wins!)
+    _extractViaCloudServer(cleanId)
+        .then(handleCandidate)
+        .catchError((_) => handleCandidate(null));
+
+    return completer.future;
+  }
+
+  static Future<String?> _extractViaNativeCppAndStreamtape(
+    String cleanId,
+  ) async {
+    try {
+      final client = _getFastHttpClient();
+      final req = await client.getUrl(
+        Uri.parse("https://streamtape.com/e/${Uri.encodeComponent(cleanId)}"),
+      );
+      final res = await req.close();
+      if (res.statusCode != 200) return null;
+
+      final html = await res.transform(utf8.decoder).join();
+
+      // 1. Primary: Native C++17 Zero-Copy Extractor (`libniooom_native_engine.so`)
+      String? extractedGetVideoUrl =
+          NativeCppEngine.extractStreamtapeUrlWithCpp(html);
+
+      // 2. Fallback: Dart Regex if Native C++ library did not match a new variant
+      if (extractedGetVideoUrl == null || extractedGetVideoUrl.isEmpty) {
+        final regex = RegExp(
+          r"""getElementById\(['"]robotlink['"]\)\.innerHTML\s*=\s*['"]([^'"]+)['"]\s*\+\s*(?:''\s*\+\s*)?\(['"]([^'"]+)['"]\)((?:\.substring\(\d+\))+)""",
         );
-        final res = await req.close();
-        if (res.statusCode == 200) {
-          final html = await res.transform(utf8.decoder).join();
-          final regex = RegExp(
-            r"""getElementById\(['"]robotlink['"]\)\.innerHTML\s*=\s*['"]([^'"]+)['"]\s*\+\s*(?:''\s*\+\s*)?\(['"]([^'"]+)['"]\)((?:\.substring\(\d+\))+)""",
-          );
-          final matches = regex.allMatches(html);
-          String? extractedGetVideoUrl;
-          for (final match in matches) {
-            final prefix = match.group(1) ?? "";
-            String suffix = match.group(2) ?? "";
-            final subPart = match.group(3) ?? "";
-            final subNums = RegExp(r"\d+").allMatches(subPart);
-            for (final nMatch in subNums) {
-              final skip = int.tryParse(nMatch.group(0) ?? "0") ?? 0;
-              if (skip > 0 && skip < suffix.length) {
-                suffix = suffix.substring(skip);
-              }
-            }
-            final combined = "$prefix$suffix";
-            if (combined.startsWith("//")) {
-              extractedGetVideoUrl = "https:$combined&stream=1";
-            } else if (combined.startsWith("/")) {
-              extractedGetVideoUrl = "https:/$combined&stream=1";
-            } else {
-              extractedGetVideoUrl = "https://$combined&stream=1";
+        final matches = regex.allMatches(html);
+        for (final match in matches) {
+          final prefix = match.group(1) ?? "";
+          String suffix = match.group(2) ?? "";
+          final subPart = match.group(3) ?? "";
+          final subNums = RegExp(r"\d+").allMatches(subPart);
+          for (final nMatch in subNums) {
+            final skip = int.tryParse(nMatch.group(0) ?? "0") ?? 0;
+            if (skip > 0 && skip < suffix.length) {
+              suffix = suffix.substring(skip);
             }
           }
-
-          if (extractedGetVideoUrl != null) {
-            try {
-              final redirectReq =
-                  await client.getUrl(Uri.parse(extractedGetVideoUrl));
-              redirectReq.followRedirects = false;
-              final redirectRes = await redirectReq.close();
-              final location =
-                  redirectRes.headers.value(HttpHeaders.locationHeader);
-              if (location != null && location.startsWith("http")) {
-                _directUrlCache[cleanId] = location;
-                return location;
-              }
-            } catch (_) {}
-
-            _directUrlCache[cleanId] = extractedGetVideoUrl;
-            return extractedGetVideoUrl;
+          final combined = "$prefix$suffix";
+          if (combined.startsWith("//")) {
+            extractedGetVideoUrl = "https:$combined&stream=1";
+          } else if (combined.startsWith("/")) {
+            extractedGetVideoUrl = "https:/$combined&stream=1";
+          } else {
+            extractedGetVideoUrl = "https://$combined&stream=1";
           }
         }
-      } finally {
-        client.close();
+      }
+
+      if (extractedGetVideoUrl != null && extractedGetVideoUrl.isNotEmpty) {
+        try {
+          final redirectReq =
+              await client.getUrl(Uri.parse(extractedGetVideoUrl));
+          redirectReq.followRedirects = false;
+          final redirectRes = await redirectReq.close();
+          final location =
+              redirectRes.headers.value(HttpHeaders.locationHeader);
+          if (location != null && location.startsWith("http")) {
+            return location;
+          }
+        } catch (_) {}
+        return extractedGetVideoUrl;
       }
     } catch (_) {}
+    return null;
+  }
 
-    // Method 2: Ask cloud server's background extractor (/api/streamtape/direct)
+  static Future<String?> _extractViaCloudServer(String cleanId) async {
     try {
-      final client = HttpClient();
-      client.connectionTimeout = const Duration(seconds: 8);
-      try {
-        final req = await client.getUrl(
-          Uri.parse(
-            "$cloudServerBaseUrl/api/streamtape/direct?file=${Uri.encodeComponent(cleanId)}",
-          ),
-        );
-        final res = await req.close();
-        if (res.statusCode == 200) {
-          final body = await res.transform(utf8.decoder).join();
-          if (body.trim().startsWith("{")) {
-            final decoded = jsonDecode(body);
-            if (decoded is Map<String, dynamic>) {
-              final url = (decoded["url"] ?? "").toString();
-              if (url.startsWith("http") && !url.contains("/e/")) {
-                _directUrlCache[cleanId] = url;
-                return url;
-              }
+      final client = _getFastHttpClient();
+      final req = await client.getUrl(
+        Uri.parse(
+          "$cloudServerBaseUrl/api/streamtape/direct?file=${Uri.encodeComponent(cleanId)}",
+        ),
+      );
+      final res = await req.close();
+      if (res.statusCode == 200) {
+        final body = await res.transform(utf8.decoder).join();
+        if (body.trim().startsWith("{")) {
+          final decoded = jsonDecode(body);
+          if (decoded is Map<String, dynamic>) {
+            final url = (decoded["url"] ?? "").toString();
+            if (url.startsWith("http") && !url.contains("/e/")) {
+              return url;
             }
           }
         }
-      } finally {
-        client.close();
       }
     } catch (_) {}
-
     return null;
   }
 
@@ -240,12 +323,22 @@ class PlatformBridge {
     required void Function() onPlay,
     required void Function() onPause,
   }) {
+    NativeCppEngine.boostPlaybackPriority(highPriority: true);
+    try {
+      _nativePlayerChannel.invokeMethod("boostPlayback");
+    } catch (_) {}
+
     final controller = VideoPlayerController.networkUrl(
       Uri.parse(src),
       httpHeaders: const {
         "User-Agent":
             "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+        "Connection": "keep-alive",
       },
+      videoPlayerOptions: VideoPlayerOptions(
+        mixWithOthers: false,
+        allowBackgroundPlayback: false,
+      ),
     );
 
     bool lastPlayingState = false;
@@ -294,6 +387,7 @@ class PlatformBridge {
   }
 
   static void playVideo(Object? videoObj, void Function() onMutedFallback) {
+    NativeCppEngine.boostPlaybackPriority(highPriority: true);
     setScreenWakelock(true);
     if (videoObj is VideoPlayerController) {
       videoObj.play();
@@ -343,6 +437,7 @@ class PlatformBridge {
   }
 
   static void enterNativeFullscreen() {
+    NativeCppEngine.boostPlaybackPriority(highPriority: true);
     setScreenWakelock(true);
     try {
       _nativePlayerChannel.invokeMethod("enterFullscreen");
@@ -390,12 +485,14 @@ class PlatformBridge {
           if (!value.isInitialized) {
             return _buildLoadingBackdrop(backdropUrl);
           }
-          return Container(
-            color: Colors.black,
-            alignment: Alignment.center,
-            child: AspectRatio(
-              aspectRatio: value.aspectRatio > 0 ? value.aspectRatio : 16 / 9,
-              child: VideoPlayer(videoObj),
+          return RepaintBoundary(
+            child: Container(
+              color: Colors.black,
+              alignment: Alignment.center,
+              child: AspectRatio(
+                aspectRatio: value.aspectRatio > 0 ? value.aspectRatio : 16 / 9,
+                child: VideoPlayer(videoObj),
+              ),
             ),
           );
         },

@@ -5,9 +5,13 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+concurrency:
+  group: niooo-m-single-build
+  cancel-in-progress: true
+
 permissions:
   contents: write
-  actions: read
+  actions: write
 
 jobs:
   build-web:
@@ -95,16 +99,77 @@ jobs:
           restore-keys: |
             android-gradle-cache-${{ runner.os }}-
 
-      - name: Ensure Android Platform Scaffold, Chrome Custom Tabs & File Picker Permissions
+      - name: Ensure Android Platform Scaffold, Native C++17 Engine, Chrome Custom Tabs & File Picker Permissions
         run: |
+          mkdir -p /tmp/niooom_cpp_backup
+          if [ -d android/app/src/main/cpp ]; then
+            cp -r android/app/src/main/cpp/* /tmp/niooom_cpp_backup/
+          fi
           rm -rf android
           flutter create --platforms=android --org com.niooo.m --project-name flutter_live_app .
+          mkdir -p android/app/src/main/cpp
+          cp -r /tmp/niooom_cpp_backup/* android/app/src/main/cpp/
+
           if [ -f android/settings.gradle.kts ]; then
             sed -i 's/id("org.jetbrains.kotlin.android") version "[^"]*"/id("org.jetbrains.kotlin.android") version "2.1.0"/g' android/settings.gradle.kts
           fi
           if [ -f android/settings.gradle ]; then
             sed -i 's/id "org.jetbrains.kotlin.android" version "[^"]*"/id "org.jetbrains.kotlin.android" version "2.1.0"/g' android/settings.gradle
           fi
+
+          # Configure android/app/build.gradle.kts with Native C++17 CMake build (-O3)
+          cat << 'EOF' > android/app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("kotlin-android")
+              id("dev.flutter.flutter-gradle-plugin")
+          }
+
+          android {
+              namespace = "com.niooo.m.flutter_live_app"
+              compileSdk = flutter.compileSdkVersion
+              ndkVersion = flutter.ndkVersion
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = JavaVersion.VERSION_17.toString()
+              }
+
+              defaultConfig {
+                  applicationId = "com.niooo.m.flutter_live_app"
+                  minSdk = flutter.minSdkVersion
+                  targetSdk = flutter.targetSdkVersion
+                  versionCode = flutter.versionCode
+                  versionName = flutter.versionName
+
+                  externalNativeBuild {
+                      cmake {
+                          cppFlags("-std=c++17 -O3 -ffast-math")
+                      }
+                  }
+              }
+
+              externalNativeBuild {
+                  cmake {
+                      path = file("src/main/cpp/CMakeLists.txt")
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      signingConfig = signingConfigs.getByName("debug")
+                  }
+              }
+          }
+
+          flutter {
+              source = "../.."
+          }
+          EOF
 
           # Configure AndroidManifest.xml with:
           # 1. File Manager / File Picker permissions & WAKE_LOCK / Fullscreen permissions
@@ -209,7 +274,7 @@ jobs:
           </manifest>
           EOF
 
-          # Configure MainActivity.kt with Native Android Fullscreen, Landscape Orientation & WakeLock MethodChannel
+          # Configure MainActivity.kt with Native C++ Engine JNI + Fullscreen, Landscape Orientation & WakeLock MethodChannel
           MAIN_KT=$(find android/app/src/main -name "MainActivity.kt" 2>/dev/null | head -n 1 || true)
           if [ -z "$MAIN_KT" ]; then
             mkdir -p android/app/src/main/kotlin/com/niooo/m/flutter_live_app
@@ -239,9 +304,28 @@ jobs:
           class MainActivity : FlutterActivity() {
               private val CHANNEL = "com.niooo.m/player"
 
+              companion object {
+                  init {
+                      try {
+                          System.loadLibrary("niooom_native_engine")
+                      } catch (_: Throwable) {
+                      }
+                  }
+              }
+
+              private external fun initNativeCppEngine(): String
+
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+                  try {
+                      initNativeCppEngine()
+                  } catch (_: Throwable) {
+                  }
                   window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  window.setFlags(
+                      WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+                      WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
+                  )
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                       window.attributes.layoutInDisplayCutoutMode =
                           WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
@@ -280,6 +364,14 @@ jobs:
                                       }
                                   }
                                   result.success(true)
+                              }
+                              "boostPlayback" -> {
+                                  try {
+                                      val status = initNativeCppEngine()
+                                      result.success(status)
+                                  } catch (_: Throwable) {
+                                      result.success("Fallback Mode")
+                                  }
                               }
                               else -> result.notImplemented()
                           }
@@ -357,3 +449,15 @@ jobs:
             echo "Creating initial single release '$TAG' with APK..."
             gh release create "$TAG" ./Niooo-M-release.apk --title "$TITLE" --notes "$NOTES" --latest
           fi
+
+      - name: Auto-Clean Older Workflow Runs (Keep Only Current Run)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Cleaning up older workflow runs so only Run #${GITHUB_RUN_ID} remains..."
+          OLD_RUNS=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs?per_page=100" --jq ".workflow_runs[] | select(.id != ${GITHUB_RUN_ID}) | .id" || true)
+          for RUN_ID in $OLD_RUNS; do
+            echo "Deleting old workflow run #$RUN_ID..."
+            gh api -X DELETE "/repos/${GITHUB_REPOSITORY}/actions/runs/$RUN_ID" || true
+          done
