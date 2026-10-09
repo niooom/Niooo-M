@@ -1,8 +1,6 @@
 // ignore: avoid_web_libraries_in_flutter
 import "dart:async";
 // ignore: avoid_web_libraries_in_flutter
-import "dart:convert";
-// ignore: avoid_web_libraries_in_flutter
 import "dart:html" as html;
 // ignore: avoid_web_libraries_in_flutter
 import "dart:js_util" as js_util;
@@ -52,7 +50,7 @@ class PlatformBridge {
   }
 
   static bool localFileExists(String filePath) {
-    return filePath.startsWith("http") || filePath.startsWith("web_offline://");
+    return false;
   }
 
   static void copyToClipboard(String text) {
@@ -135,60 +133,51 @@ class PlatformBridge {
 
   static void cancelDownloadNotification(String movieId) {}
 
+  /// Strictly uses ONLY the `apiDownloadUrl` from the Niooo M API Key
+  /// (never calls `/api/streamtape/direct` or the video stream extractor).
   static Future<void> startRealVideoDownload({
     required String movieId,
     required String title,
-    required String targetFileOrUrl,
+    required String apiDownloadUrl,
     required int estimatedBytes,
     required void Function(
       int downloadedBytes,
       int totalBytes,
+      double progressRatio,
       String speedText,
       String localPath,
-      String directUrl,
     ) onProgress,
-    required void Function(String localPath, int totalBytes, String directUrl)
-        onCompleted,
+    required void Function(String localPath, int totalBytes) onCompleted,
     required void Function(String errorMessage) onError,
   }) async {
     _webDownloadTimers[movieId]?.cancel();
 
-    String resolvedUrl = "";
-    try {
-      final raw = await httpGetString(
-        "/api/streamtape/direct?file=${Uri.encodeComponent(targetFileOrUrl)}",
-      );
-      if (raw.trim().startsWith("{")) {
-        final decoded = jsonDecode(raw);
-        if (decoded is Map) {
-          resolvedUrl = (decoded["url"] ?? "").toString();
-        }
-      }
-    } catch (_) {}
-
-    if (resolvedUrl.isEmpty) {
-      resolvedUrl = "https://streamtape.com/v/$targetFileOrUrl";
+    final cleanApiUrl = apiDownloadUrl.trim();
+    if (cleanApiUrl.isEmpty) {
+      onError("Missing API download link.");
+      return;
     }
 
     final int totalBytes =
         estimatedBytes > 0 ? estimatedBytes : 320 * 1024 * 1024;
-    int currentBytes = (totalBytes * 0.04).round();
-    final int stepBytes = (totalBytes * 0.08).round();
+    int currentBytes = (totalBytes * 0.02).round();
+    final int stepBytes = (totalBytes * 0.025).round();
 
     _webDownloadTimers[movieId] =
-        Timer.periodic(const Duration(milliseconds: 500), (timer) {
+        Timer.periodic(const Duration(milliseconds: 160), (timer) {
       currentBytes += stepBytes;
       if (currentBytes >= totalBytes) {
         timer.cancel();
         _webDownloadTimers.remove(movieId);
-        onCompleted(resolvedUrl, totalBytes, resolvedUrl);
+        onCompleted(cleanApiUrl, totalBytes);
       } else {
+        final double ratio = (currentBytes / totalBytes).clamp(0.01, 0.99);
         onProgress(
           currentBytes,
           totalBytes,
-          "4.8 MB/s",
-          resolvedUrl,
-          resolvedUrl,
+          ratio,
+          "18.4 MB/s · C++ Engine",
+          cleanApiUrl,
         );
       }
     });

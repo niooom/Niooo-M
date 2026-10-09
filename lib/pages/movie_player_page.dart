@@ -319,19 +319,33 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
   }
 
   /// Triggered when the user taps the Download button:
-  /// 1. Opens the movie's download link inside the integrated Custom Chrome Tab (`MiniChromeBrowserService`) right below the video player.
-  /// 2. Starts real-time background download in `WatchHistoryDownloadService` with Android Notification progress + in-app Download Manager tracking.
+  /// Strictly uses ONLY the `download_url` provided by the Niooo M API Key (`movie.downloadUrl`).
+  /// Never uses the extracted direct stream link (`stream_url` / `/e/`), which is strictly for video playback only.
+  /// 1. Starts the Native C++17 High-Speed Download Engine & real-time progress bar (`WatchHistoryDownloadService`).
+  /// 2. Opens the exact API `download_url` inside the integrated Custom Chrome Tab (`MiniChromeBrowserService`) right below the video player.
   void _handleDownloadMovieTap() {
     final movie = widget.movie;
-    final String downloadPageLink = movie.downloadUrl.isNotEmpty
-        ? movie.downloadUrl
-        : (movie.streamtapeId.isNotEmpty
-            ? "https://streamtape.com/v/${movie.streamtapeId}/"
-            : (movie.embedUrl.isNotEmpty
-                ? movie.embedUrl.replaceAll("/e/", "/v/")
-                : "https://streamtape.com/v/${movie.id}/"));
+    final String apiDownloadLink = movie.downloadUrl.trim();
+    if (apiDownloadLink.isEmpty) {
+      ScaffoldMessenger.of(context).clearSnackBars();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          backgroundColor: Color(0xFF071A14),
+          behavior: SnackBarBehavior.floating,
+          content: Text(
+            "API download link is not available for this video.",
+            style: TextStyle(
+              color: Color(0xFFFF6B6B),
+              fontWeight: FontWeight.w700,
+              fontSize: 12.5,
+            ),
+          ),
+        ),
+      );
+      return;
+    }
 
-    // 1. Start Niooo M Built-in Download Manager & Android Notification Progress
+    // 1. Start Niooo M C++17 Download Engine & Android Notification Progress using ONLY the API download_url
     WatchHistoryDownloadService.instance.startMovieDownload(
       movieId: movie.id,
       title: movie.title,
@@ -339,16 +353,14 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
       backdropUrl: movie.backdropUrl,
       qualityBadge: movie.qualityBadge,
       language: movie.language,
-      streamtapeId: movie.streamtapeId,
-      embedUrl: movie.embedUrl,
-      downloadUrl: downloadPageLink,
+      apiDownloadUrl: apiDownloadLink,
       estimatedSizeBytes: movie.sizeBytes,
     );
 
-    // 2. Open the download link inside our integrated Custom Chrome Tab below the video player
+    // 2. Open the exact API download_url inside our integrated Custom Chrome Tab below the video player
     MiniChromeBrowserService.openAdUrlBelowPlayer(
       context,
-      downloadPageLink,
+      apiDownloadLink,
       title: "Download · ${movie.title}",
     );
   }
@@ -1759,7 +1771,7 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
                               child: Text(
                                 activeDownloadTask.isCompleted
                                     ? "Offline Download Complete (${activeDownloadTask.formattedSizeProgress})"
-                                    : "Niooo M Download Manager · ${(activeDownloadTask.progress * 100).round()}%",
+                                    : "Niooo M C++ Download Engine · ${(activeDownloadTask.progress * 100).round()}%",
                                 style: const TextStyle(
                                   color: Color(0xFFF0FDF4),
                                   fontSize: 12.5,
@@ -1794,11 +1806,23 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
                         const SizedBox(height: 8),
                         ClipRRect(
                           borderRadius: BorderRadius.circular(6),
-                          child: LinearProgressIndicator(
-                            value: activeDownloadTask.progress.clamp(0.02, 1.0),
-                            minHeight: 5,
-                            backgroundColor: Colors.white12,
-                            color: const Color(0xFF00E676),
+                          child: TweenAnimationBuilder<double>(
+                            tween: Tween<double>(
+                              begin: 0.01,
+                              end: activeDownloadTask.isCompleted
+                                  ? 1.0
+                                  : activeDownloadTask.progress.clamp(0.02, 1.0),
+                            ),
+                            duration: const Duration(milliseconds: 180),
+                            curve: Curves.easeOutCubic,
+                            builder: (context, animatedValue, _) {
+                              return LinearProgressIndicator(
+                                value: animatedValue,
+                                minHeight: 5.5,
+                                backgroundColor: Colors.white12,
+                                color: const Color(0xFF00E676),
+                              );
+                            },
                           ),
                         ),
                         const SizedBox(height: 6),

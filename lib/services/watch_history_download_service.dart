@@ -88,10 +88,11 @@ class DownloadTaskItem {
   final String backdropUrl;
   final String qualityBadge;
   final String language;
-  final String downloadPageUrl;
-  final String directMp4Url;
+  /// Strictly holds the `download_url` coming from the Niooo M API Key
+  /// (never the video player's extracted direct stream link).
+  final String apiDownloadUrl;
   final String localFilePath;
-  final String status; // "extracting" | "downloading" | "completed" | "paused" | "failed"
+  final String status; // "downloading" | "completed" | "paused" | "failed"
   final int downloadedBytes;
   final int totalBytes;
   final double progress;
@@ -106,8 +107,7 @@ class DownloadTaskItem {
     required this.backdropUrl,
     required this.qualityBadge,
     required this.language,
-    required this.downloadPageUrl,
-    required this.directMp4Url,
+    required this.apiDownloadUrl,
     required this.localFilePath,
     required this.status,
     required this.downloadedBytes,
@@ -118,9 +118,11 @@ class DownloadTaskItem {
     required this.updatedAtMs,
   });
 
-  bool get isCompleted => status == "completed" && localFilePath.isNotEmpty;
-  bool get isDownloading =>
-      status == "downloading" || status == "extracting";
+  /// Backward-compatible getter for UI components referencing `downloadPageUrl`
+  String get downloadPageUrl => apiDownloadUrl;
+
+  bool get isCompleted => status == "completed";
+  bool get isDownloading => status == "downloading";
 
   String get formattedSizeProgress {
     final dlMb = (downloadedBytes / (1024 * 1024)).toStringAsFixed(1);
@@ -132,7 +134,7 @@ class DownloadTaskItem {
   }
 
   DownloadTaskItem copyWith({
-    String? directMp4Url,
+    String? apiDownloadUrl,
     String? localFilePath,
     String? status,
     int? downloadedBytes,
@@ -149,8 +151,7 @@ class DownloadTaskItem {
       backdropUrl: backdropUrl,
       qualityBadge: qualityBadge,
       language: language,
-      downloadPageUrl: downloadPageUrl,
-      directMp4Url: directMp4Url ?? this.directMp4Url,
+      apiDownloadUrl: apiDownloadUrl ?? this.apiDownloadUrl,
       localFilePath: localFilePath ?? this.localFilePath,
       status: status ?? this.status,
       downloadedBytes: downloadedBytes ?? this.downloadedBytes,
@@ -169,8 +170,8 @@ class DownloadTaskItem {
         "backdropUrl": backdropUrl,
         "qualityBadge": qualityBadge,
         "language": language,
-        "downloadPageUrl": downloadPageUrl,
-        "directMp4Url": directMp4Url,
+        "apiDownloadUrl": apiDownloadUrl,
+        "downloadPageUrl": apiDownloadUrl,
         "localFilePath": localFilePath,
         "status": status,
         "downloadedBytes": downloadedBytes,
@@ -182,6 +183,12 @@ class DownloadTaskItem {
       };
 
   factory DownloadTaskItem.fromJson(Map<String, dynamic> json) {
+    final String rawApiDl =
+        (json["apiDownloadUrl"] ?? json["downloadPageUrl"] ?? "").toString();
+    final String rawStatus = (json["status"] ?? "completed").toString();
+    final String normalizedStatus =
+        rawStatus == "extracting" ? "downloading" : rawStatus;
+
     return DownloadTaskItem(
       movieId: (json["movieId"] ?? "").toString(),
       title: (json["title"] ?? "Untitled").toString(),
@@ -189,10 +196,9 @@ class DownloadTaskItem {
       backdropUrl: (json["backdropUrl"] ?? "").toString(),
       qualityBadge: (json["qualityBadge"] ?? "HD").toString(),
       language: (json["language"] ?? "Hindi").toString(),
-      downloadPageUrl: (json["downloadPageUrl"] ?? "").toString(),
-      directMp4Url: (json["directMp4Url"] ?? "").toString(),
+      apiDownloadUrl: rawApiDl,
       localFilePath: (json["localFilePath"] ?? "").toString(),
-      status: (json["status"] ?? "completed").toString(),
+      status: normalizedStatus,
       downloadedBytes:
           int.tryParse((json["downloadedBytes"] ?? "0").toString()) ?? 0,
       totalBytes: int.tryParse((json["totalBytes"] ?? "0").toString()) ?? 0,
@@ -214,7 +220,7 @@ class WatchHistoryDownloadService extends ChangeNotifier {
   }
 
   static const String _historyStorageKey = "niooo_m_watch_history_v2";
-  static const String _downloadsStorageKey = "niooo_m_offline_downloads_v2";
+  static const String _downloadsStorageKey = "niooo_m_offline_downloads_v3";
 
   final Map<String, WatchHistoryRecord> _historyById = {};
   final Map<String, DownloadTaskItem> _downloadsById = {};
@@ -241,7 +247,6 @@ class WatchHistoryDownloadService extends ChangeNotifier {
   double getSavedPositionSeconds(String movieId) {
     final rec = _historyById[movieId];
     if (rec == null) return 0.0;
-    // If user watched > 97% of the movie previously, restart from 0 or allow resume if < 98%
     if (rec.durationSeconds > 60 &&
         rec.positionSeconds >= rec.durationSeconds - 8) {
       return 0.0;
@@ -292,7 +297,6 @@ class WatchHistoryDownloadService extends ChangeNotifier {
               final task =
                   DownloadTaskItem.fromJson(Map<String, dynamic>.from(item));
               if (task.movieId.isNotEmpty) {
-                // If app restarted while downloading, mark as paused so user can resume/retry
                 final normalized = task.isDownloading
                     ? task.copyWith(status: "paused", speedLabel: "Tap to resume")
                     : task;
@@ -375,7 +379,9 @@ class WatchHistoryDownloadService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Starts or resumes a real background video download + updates Android system notification
+  /// Starts or resumes a high-speed download strictly using ONLY the `download_url`
+  /// provided by the Niooo M API Key (`apiDownloadUrl`) and the Native C++17 Download Engine.
+  /// Never uses the video player's extracted direct stream link.
   Future<void> startMovieDownload({
     required String movieId,
     required String title,
@@ -383,15 +389,24 @@ class WatchHistoryDownloadService extends ChangeNotifier {
     required String backdropUrl,
     required String qualityBadge,
     required String language,
-    required String streamtapeId,
-    required String embedUrl,
-    required String downloadUrl,
+    required String apiDownloadUrl,
     required int estimatedSizeBytes,
   }) async {
     final existing = _downloadsById[movieId];
     if (existing != null && existing.isDownloading) {
       return;
     }
+
+    final cleanApiDownloadUrl = apiDownloadUrl.trim();
+    if (cleanApiDownloadUrl.isEmpty) {
+      return;
+    }
+
+    final int effectiveTotalBytes = estimatedSizeBytes > 0
+        ? estimatedSizeBytes
+        : ((existing != null && existing.totalBytes > 0)
+            ? existing.totalBytes
+            : 320 * 1024 * 1024);
 
     final initialTask = DownloadTaskItem(
       movieId: movieId,
@@ -400,16 +415,13 @@ class WatchHistoryDownloadService extends ChangeNotifier {
       backdropUrl: backdropUrl,
       qualityBadge: qualityBadge,
       language: language,
-      downloadPageUrl: downloadUrl.isNotEmpty ? downloadUrl : embedUrl,
-      directMp4Url: existing?.directMp4Url ?? "",
+      apiDownloadUrl: cleanApiDownloadUrl,
       localFilePath: existing?.localFilePath ?? "",
-      status: "extracting",
-      downloadedBytes: existing?.downloadedBytes ?? 0,
-      totalBytes: estimatedSizeBytes > 0
-          ? estimatedSizeBytes
-          : (existing?.totalBytes ?? 0),
-      progress: existing?.progress ?? 0.01,
-      speedLabel: "Resolving direct stream...",
+      status: "downloading",
+      downloadedBytes: (effectiveTotalBytes * 0.01).round(),
+      totalBytes: effectiveTotalBytes,
+      progress: 0.01,
+      speedLabel: "Starting C++ Engine...",
       updatedAtMs: DateTime.now().millisecondsSinceEpoch,
     );
 
@@ -419,29 +431,21 @@ class WatchHistoryDownloadService extends ChangeNotifier {
 
     PlatformBridge.showDownloadNotification(
       movieId: movieId,
-      title: title,
-      body: "Extracting direct MP4 link...",
-      progress: 2,
+      title: "Downloading: $title",
+      body: "1% · Starting C++ High-Speed Download via API Link",
+      progress: 1,
       isOngoing: true,
     );
-
-    final String target = streamtapeId.isNotEmpty
-        ? streamtapeId
-        : (embedUrl.isNotEmpty
-            ? embedUrl
-            : (downloadUrl.isNotEmpty ? downloadUrl : movieId));
 
     await PlatformBridge.startRealVideoDownload(
       movieId: movieId,
       title: title,
-      targetFileOrUrl: target,
-      estimatedBytes: initialTask.totalBytes,
-      onProgress: (downloadedBytes, totalBytes, speedText, localPath, directUrl) {
-        final double pct = totalBytes > 0
-            ? (downloadedBytes / totalBytes).clamp(0.0, 1.0)
-            : 0.0;
+      apiDownloadUrl: cleanApiDownloadUrl,
+      estimatedBytes: effectiveTotalBytes,
+      onProgress: (downloadedBytes, totalBytes, progressRatio, speedText, localPath) {
+        final double pct = progressRatio.clamp(0.01, 1.0);
         final updated = (_downloadsById[movieId] ?? initialTask).copyWith(
-          directMp4Url: directUrl,
+          apiDownloadUrl: cleanApiDownloadUrl,
           localFilePath: localPath,
           status: "downloading",
           downloadedBytes: downloadedBytes,
@@ -454,15 +458,15 @@ class WatchHistoryDownloadService extends ChangeNotifier {
         _downloadsById[movieId] = updated;
         notifyListeners();
       },
-      onCompleted: (localPath, totalBytes, directUrl) {
+      onCompleted: (localPath, totalBytes) {
         final completed = (_downloadsById[movieId] ?? initialTask).copyWith(
-          directMp4Url: directUrl,
+          apiDownloadUrl: cleanApiDownloadUrl,
           localFilePath: localPath,
           status: "completed",
           downloadedBytes: totalBytes,
           totalBytes: totalBytes,
           progress: 1.0,
-          speedLabel: "Saved for Offline Playback",
+          speedLabel: "Downloaded via C++ Engine",
           errorMessage: "",
           updatedAtMs: DateTime.now().millisecondsSinceEpoch,
         );

@@ -214,11 +214,14 @@ class MovieItem {
     int index = 0,
   }) {
     final String rawId = (json["id"] ?? "").toString();
-    final String streamUrl = (json["stream_url"] ?? json["embedUrl"] ?? "").toString();
-    final String downloadUrl = (json["download_url"] ?? json["downloadUrl"] ?? "").toString();
+    final String streamUrl = (json["stream_url"] ?? json["embedUrl"] ?? "").toString().trim();
+    final String rawDownloadUrl = (json["download_url"] ?? json["downloadUrl"] ?? "").toString().trim();
     final String stId = (json["streamtapeId"] ?? "").toString().isNotEmpty
         ? json["streamtapeId"].toString()
-        : NiooomPublicApiService.extractStreamtapeFileId(streamUrl, downloadUrl);
+        : NiooomPublicApiService.extractStreamtapeFileId(streamUrl, rawDownloadUrl);
+    final String downloadUrl = rawDownloadUrl.isNotEmpty
+        ? rawDownloadUrl
+        : (stId.isNotEmpty ? "https://streamtape.com/v/$stId/" : "");
 
     final String effectiveId = rawId.isNotEmpty ? rawId : stId;
     final String rawTitle = (json["rawTitle"] ?? json["title"] ?? "Untitled Video").toString();

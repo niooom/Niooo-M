@@ -97,10 +97,9 @@ class _ProfileSettingsPageState extends State<ProfileSettingsPage> {
       posterUrl: task.posterUrl,
       backdropUrl: task.backdropUrl,
       embedUrl: "https://streamtape.com/e/${task.movieId}/",
-      downloadUrl: task.downloadPageUrl,
-      videoStreamUrl: task.localFilePath.isNotEmpty
-          ? task.localFilePath
-          : task.directMp4Url,
+      downloadUrl: task.apiDownloadUrl,
+      videoStreamUrl:
+          "/api/streamtape/direct?file=${Uri.encodeComponent(task.movieId)}",
       sizeBytes: task.totalBytes,
       rating: 9.3,
       releaseYear: 2025,
@@ -740,13 +739,23 @@ class _ProfileSettingsPageState extends State<ProfileSettingsPage> {
               const SizedBox(height: 10),
               ClipRRect(
                 borderRadius: BorderRadius.circular(6),
-                child: LinearProgressIndicator(
-                  value: task.isCompleted
-                      ? 1.0
-                      : task.progress.clamp(0.03, 1.0),
-                  minHeight: 5.5,
-                  backgroundColor: Colors.white12,
-                  color: const Color(0xFF00E676),
+                child: TweenAnimationBuilder<double>(
+                  tween: Tween<double>(
+                    begin: 0.01,
+                    end: task.isCompleted
+                        ? 1.0
+                        : task.progress.clamp(0.02, 1.0),
+                  ),
+                  duration: const Duration(milliseconds: 180),
+                  curve: Curves.easeOutCubic,
+                  builder: (context, animatedValue, _) {
+                    return LinearProgressIndicator(
+                      value: animatedValue,
+                      minHeight: 5.5,
+                      backgroundColor: Colors.white12,
+                      color: const Color(0xFF00E676),
+                    );
+                  },
                 ),
               ),
               const SizedBox(height: 10),
@@ -789,13 +798,13 @@ class _ProfileSettingsPageState extends State<ProfileSettingsPage> {
                     ),
                   ),
                   const SizedBox(width: 8),
-                  // Open in Custom Chrome Tab Button
-                  if (task.downloadPageUrl.isNotEmpty)
+                  // Open API download_url in Custom Chrome Tab Button
+                  if (task.apiDownloadUrl.isNotEmpty)
                     GestureDetector(
                       onTap: () {
                         MiniChromeBrowserService.openAdUrlBelowPlayer(
                           context,
-                          task.downloadPageUrl,
+                          task.apiDownloadUrl,
                           title: "Download · ${task.title}",
                         );
                       },
@@ -845,9 +854,7 @@ class _ProfileSettingsPageState extends State<ProfileSettingsPage> {
                           backdropUrl: task.backdropUrl,
                           qualityBadge: task.qualityBadge,
                           language: task.language,
-                          streamtapeId: task.movieId,
-                          embedUrl: "https://streamtape.com/e/${task.movieId}/",
-                          downloadUrl: task.downloadPageUrl,
+                          apiDownloadUrl: task.apiDownloadUrl,
                           estimatedSizeBytes: task.totalBytes,
                         );
                       },
