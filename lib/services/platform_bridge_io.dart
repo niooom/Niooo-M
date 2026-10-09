@@ -456,6 +456,26 @@ class PlatformBridge {
     } catch (_) {}
   }
 
+  /// Launches Google Chrome's native Partial Custom Tab via Android's `androidx.browser.customtabs`
+  /// in `MainActivity.kt` with exact physical pixel height (`heightPx`) below the 16:9 video player.
+  static Future<bool> openPartialChromeCustomTab({
+    required String url,
+    required int heightPx,
+  }) async {
+    try {
+      final res = await _nativePlayerChannel.invokeMethod<bool>(
+        "openPartialChromeCustomTab",
+        {
+          "url": url,
+          "heightPx": heightPx,
+        },
+      );
+      return res == true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// Queries Android's native `DownloadManager` & Chrome Downloads directory (via `MainActivity.kt`)
   /// to detect in real time when the user starts a download inside the Google Chrome Custom Tab.
   static Future<Map<String, dynamic>?> pollSystemActiveDownload(

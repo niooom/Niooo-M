@@ -133,6 +133,13 @@ class PlatformBridge {
 
   static void cancelDownloadNotification(String movieId) {}
 
+  static Future<bool> openPartialChromeCustomTab({
+    required String url,
+    required int heightPx,
+  }) async {
+    return false;
+  }
+
   static Future<Map<String, dynamic>?> pollSystemActiveDownload(
     String apiDownloadUrl,
   ) async {

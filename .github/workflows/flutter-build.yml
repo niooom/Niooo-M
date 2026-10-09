@@ -117,7 +117,13 @@ jobs:
             sed -i 's/id "org.jetbrains.kotlin.android" version "[^"]*"/id "org.jetbrains.kotlin.android" version "2.1.0"/g' android/settings.gradle
           fi
 
-          # Configure android/app/build.gradle.kts with Native C++17 CMake build (-O3)
+          # Decode permanent Release Keystore (`signing/niooom_release_keystore.p12.b64`) so every APK build has the exact same cryptographic signature
+          mkdir -p android/app/signing
+          if [ -f signing/niooom_release_keystore.p12.b64 ]; then
+            base64 -d signing/niooom_release_keystore.p12.b64 > android/app/signing/niooom_release.p12
+          fi
+
+          # Configure android/app/build.gradle.kts with Permanent Release Signature & Native C++17 CMake build (-O3)
           cat << 'EOF' > android/app/build.gradle.kts
           plugins {
               id("com.android.application")
@@ -159,11 +165,37 @@ jobs:
                   }
               }
 
-              buildTypes {
-                  release {
-                      signingConfig = signingConfigs.getByName("debug")
+              signingConfigs {
+                  create("release") {
+                      val keystoreFile = file("signing/niooom_release.p12")
+                      if (keystoreFile.exists()) {
+                          storeFile = keystoreFile
+                          storeType = "PKCS12"
+                          storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "niooom2026release"
+                          keyAlias = System.getenv("KEY_ALIAS") ?: "niooom_release_key"
+                          keyPassword = System.getenv("KEY_PASSWORD") ?: "niooom2026release"
+                          enableV1Signing = true
+                          enableV2Signing = true
+                      }
                   }
               }
+
+              buildTypes {
+                  release {
+                      val releaseKeystore = file("signing/niooom_release.p12")
+                      signingConfig = if (releaseKeystore.exists()) {
+                          signingConfigs.getByName("release")
+                      } else {
+                          signingConfigs.getByName("debug")
+                      }
+                      isMinifyEnabled = false
+                      isShrinkResources = false
+                  }
+              }
+          }
+
+          dependencies {
+              implementation("androidx.browser:browser:1.8.0")
           }
 
           flutter {
@@ -275,7 +307,7 @@ jobs:
           </manifest>
           EOF
 
-          # Configure MainActivity.kt with Native C++ Engine JNI + Fullscreen, Landscape Orientation, WakeLock & Download NotificationManager MethodChannel
+          # Configure MainActivity.kt with Native C++ Engine JNI + Partial Chrome Custom Tabs (Below 16:9 Player) + Fullscreen & Download NotificationManager MethodChannel
           MAIN_KT=$(find android/app/src/main -name "MainActivity.kt" 2>/dev/null | head -n 1 || true)
           if [ -z "$MAIN_KT" ]; then
             mkdir -p android/app/src/main/kotlin/com/niooo/m/flutter_live_app
@@ -295,10 +327,12 @@ jobs:
           import android.app.NotificationChannel
           import android.app.NotificationManager
           import android.app.PendingIntent
+          import android.content.ComponentName
           import android.content.Context
           import android.content.Intent
           import android.content.pm.ActivityInfo
           import android.database.Cursor
+          import android.graphics.Color
           import android.net.Uri
           import android.os.Build
           import android.os.Bundle
@@ -307,6 +341,12 @@ jobs:
           import android.view.WindowInsets
           import android.view.WindowInsetsController
           import android.view.WindowManager
+          import androidx.browser.customtabs.CustomTabColorSchemeParams
+          import androidx.browser.customtabs.CustomTabsCallback
+          import androidx.browser.customtabs.CustomTabsClient
+          import androidx.browser.customtabs.CustomTabsIntent
+          import androidx.browser.customtabs.CustomTabsServiceConnection
+          import androidx.browser.customtabs.CustomTabsSession
           import androidx.core.app.NotificationCompat
           import io.flutter.embedding.android.FlutterActivity
           import io.flutter.embedding.engine.FlutterEngine
@@ -319,6 +359,10 @@ jobs:
               private var lastBytesSample: Long = 0L
               private var lastTimeSampleMs: Long = 0L
               private var downloadMonitorStartMs: Long = 0L
+
+              private var customTabsClient: CustomTabsClient? = null
+              private var customTabsSession: CustomTabsSession? = null
+              private var customTabsServiceConnection: CustomTabsServiceConnection? = null
 
               companion object {
                   init {
@@ -338,6 +382,7 @@ jobs:
                   } catch (_: Throwable) {
                   }
                   createDownloadNotificationChannel()
+                  bindChromeCustomTabsService()
                   window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                   window.setFlags(
                       WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
@@ -346,6 +391,147 @@ jobs:
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                       window.attributes.layoutInDisplayCutoutMode =
                           WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                  }
+              }
+
+              override fun onDestroy() {
+                  try {
+                      customTabsServiceConnection?.let { unbindService(it) }
+                  } catch (_: Throwable) {
+                  }
+                  super.onDestroy()
+              }
+
+              private fun resolveChromeCustomTabsPackage(): String? {
+                  val candidates = listOf(
+                      "com.android.chrome",
+                      "com.chrome.beta",
+                      "com.chrome.dev",
+                      "com.chrome.canary",
+                      "com.microsoft.emmx",
+                      "org.mozilla.firefox"
+                  )
+                  val preferred = CustomTabsClient.getPackageName(this, candidates, true)
+                  if (!preferred.isNullOrBlank()) {
+                      return preferred
+                  }
+                  return CustomTabsClient.getPackageName(this, null)
+              }
+
+              private fun bindChromeCustomTabsService() {
+                  try {
+                      val pkg = resolveChromeCustomTabsPackage() ?: return
+                      val connection = object : CustomTabsServiceConnection() {
+                          override fun onCustomTabsServiceConnected(
+                              name: ComponentName,
+                              client: CustomTabsClient
+                          ) {
+                              customTabsClient = client
+                              try {
+                                  client.warmup(0L)
+                                  customTabsSession = client.newSession(CustomTabsCallback())
+                              } catch (_: Throwable) {
+                              }
+                          }
+
+                          override fun onServiceDisconnected(name: ComponentName?) {
+                              customTabsClient = null
+                              customTabsSession = null
+                          }
+                      }
+                      customTabsServiceConnection = connection
+                      CustomTabsClient.bindCustomTabsService(this, pkg, connection)
+                  } catch (_: Throwable) {
+                  }
+              }
+
+              private fun ensureCustomTabsSession(): CustomTabsSession? {
+                  if (customTabsSession != null) {
+                      return customTabsSession
+                  }
+                  try {
+                      customTabsSession = customTabsClient?.newSession(CustomTabsCallback())
+                  } catch (_: Throwable) {
+                  }
+                  return customTabsSession
+              }
+
+              /**
+               * Opens the URL directly in Google Chrome's Partial Custom Tab strictly below the
+               * top 16:9 video player (`heightPx` in physical screen pixels).
+               * Notice: We MUST use `customTabsIntent.intent.data = uri` and `startActivity(customTabsIntent.intent)`
+               * WITHOUT calling `customTabsIntent.launchUrl(this, uri)` because `launchUrl` adds `FLAG_ACTIVITY_NEW_TASK`
+               * on several devices/wrappers, which forces Chrome into fullscreen instead of partial height!
+               */
+              private fun launchPartialChromeCustomTabBelowPlayer(url: String, requestedHeightPx: Int): Boolean {
+                  return try {
+                      val dm = resources.displayMetrics
+                      val screenWidthPx = dm.widthPixels
+                      val screenHeightPx = dm.heightPixels
+                      val statusBarId = resources.getIdentifier("status_bar_height", "dimen", "android")
+                      val statusBarPx = if (statusBarId > 0) resources.getDimensionPixelSize(statusBarId) else (24 * dm.density).toInt()
+                      val playerHeightPx = (screenWidthPx * 9) / 16
+                      val calculatedBelowPlayerPx = (screenHeightPx - statusBarPx - playerHeightPx - (4 * dm.density).toInt())
+                          .coerceIn((screenHeightPx * 0.42).toInt(), (screenHeightPx * 0.78).toInt())
+
+                      val finalHeightPx = if (requestedHeightPx in 300..(screenHeightPx - 120)) {
+                          requestedHeightPx
+                      } else {
+                          calculatedBelowPlayerPx
+                      }
+
+                      val session = ensureCustomTabsSession()
+                      val colorScheme = CustomTabColorSchemeParams.Builder()
+                          .setToolbarColor(Color.parseColor("#061510"))
+                          .setNavigationBarColor(Color.parseColor("#030706"))
+                          .setNavigationBarDividerColor(Color.parseColor("#00E676"))
+                          .build()
+
+                      val builder = if (session != null) {
+                          CustomTabsIntent.Builder(session)
+                      } else {
+                          CustomTabsIntent.Builder()
+                      }
+
+                      builder.setDefaultColorSchemeParams(colorScheme)
+                      builder.setShowTitle(true)
+                      builder.setUrlBarHidingEnabled(true)
+                      builder.setShareState(CustomTabsIntent.SHARE_STATE_ON)
+                      builder.setInitialActivityHeightPx(
+                          finalHeightPx,
+                          CustomTabsIntent.ACTIVITY_HEIGHT_FIXED
+                      )
+                      builder.setToolbarCornerRadiusDp(20)
+
+                      val customTabsIntent = builder.build()
+                      val pkg = resolveChromeCustomTabsPackage()
+                      if (!pkg.isNullOrBlank()) {
+                          customTabsIntent.intent.setPackage(pkg)
+                      }
+
+                      val uri = Uri.parse(url)
+                      customTabsIntent.intent.data = uri
+                      // Explicitly put partial Custom Tab extras to guarantee Chrome honors the exact pixel height below the player
+                      customTabsIntent.intent.putExtra(
+                          "androidx.browser.customtabs.extra.INITIAL_ACTIVITY_HEIGHT_PX",
+                          finalHeightPx
+                      )
+                      customTabsIntent.intent.putExtra(
+                          "androidx.browser.customtabs.extra.ACTIVITY_HEIGHT_RESIZE_BEHAVIOR",
+                          CustomTabsIntent.ACTIVITY_HEIGHT_FIXED
+                      )
+                      customTabsIntent.intent.putExtra(
+                          "androidx.browser.customtabs.extra.TOOLBAR_CORNER_RADIUS_DP",
+                          20
+                      )
+                      // Ensure FLAG_ACTIVITY_NEW_TASK is NOT set so the Partial Custom Tab stays attached to MainActivity
+                      customTabsIntent.intent.flags = customTabsIntent.intent.flags and Intent.FLAG_ACTIVITY_NEW_TASK.inv()
+
+                      downloadMonitorStartMs = System.currentTimeMillis()
+                      startActivityForResult(customTabsIntent.intent, 9042)
+                      true
+                  } catch (_: Throwable) {
+                      false
                   }
               }
 
@@ -567,6 +753,18 @@ jobs:
                   MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
                       .setMethodCallHandler { call, result ->
                           when (call.method) {
+                              "openPartialChromeCustomTab" -> {
+                                  val url = call.argument<String>("url") ?: ""
+                                  val heightPx = call.argument<Int>("heightPx") ?: 0
+                                  if (url.isBlank()) {
+                                      result.success(false)
+                                  } else {
+                                      runOnUiThread {
+                                          val launched = launchPartialChromeCustomTabBelowPlayer(url, heightPx)
+                                          result.success(launched)
+                                      }
+                                  }
+                              }
                               "enterFullscreen" -> {
                                   runOnUiThread {
                                       window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)

@@ -2,17 +2,18 @@ import "dart:async";
 import "package:flutter/material.dart";
 import "package:flutter_custom_tabs/flutter_custom_tabs.dart" as custom_tabs;
 import "package:url_launcher/url_launcher.dart" as url_launcher;
+import "platform_bridge.dart";
 import "watch_history_download_service.dart";
 
 /// Google Chrome Custom Tabs Service for Niooo M.
 ///
-/// Strictly uses ONLY Google Chrome's native Custom Tabs (`PartialCustomTabsConfiguration`)
-/// sized from the bottom of the screen right up to the bottom edge of the top 16:9 video player.
+/// Strictly uses ONLY Google Chrome's native Custom Tabs (`androidx.browser.customtabs.CustomTabsIntent`)
+/// sized in physical pixels from the bottom of the screen right up to the bottom edge of the top 16:9 video player.
 /// Does NOT use any custom in-app WebView or custom bottom-sheet browser!
 class MiniChromeBrowserService {
   MiniChromeBrowserService._();
 
-  /// Calculates the exact height from the bottom of the screen up to the bottom
+  /// Calculates the logical height from the bottom of the screen up to the bottom
   /// edge of the top 16:9 video player so Google Chrome Custom Tabs never covers the player.
   static double calculateBelowPlayerHeight(BuildContext context) {
     final media = MediaQuery.of(context);
@@ -21,8 +22,17 @@ class MiniChromeBrowserService {
     final topPadding = media.padding.top;
     final videoPlayerHeight = screenWidth * (9.0 / 16.0);
     final availableBelowPlayer =
-        screenHeight - topPadding - videoPlayerHeight - 4.0;
-    return availableBelowPlayer.clamp(240.0, screenHeight * 0.72);
+        screenHeight - topPadding - videoPlayerHeight - 2.0;
+    return availableBelowPlayer.clamp(240.0, screenHeight * 0.78);
+  }
+
+  /// Calculates the exact PHYSICAL PIXEL height (`px`) below the 16:9 video player
+  /// required by Android's `CustomTabsIntent.Builder.setInitialActivityHeightPx(...)`.
+  static int calculateBelowPlayerHeightPx(BuildContext context) {
+    final media = MediaQuery.of(context);
+    final dpr = media.devicePixelRatio > 0 ? media.devicePixelRatio : 2.75;
+    final logicalHeight = calculateBelowPlayerHeight(context);
+    return (logicalHeight * dpr).round();
   }
 
   /// Opens the Movie's API `download_url` directly inside Google Chrome's native
@@ -91,8 +101,24 @@ class MiniChromeBrowserService {
     );
     if (uri == null) return;
 
+    final int heightPx = calculateBelowPlayerHeightPx(context);
+
+    // 1. First, launch via Android's native CustomTabsIntent.Builder.setInitialActivityHeightPx
+    // in MainActivity.kt, which passes physical pixels (px) + CustomTabsSession so Chrome
+    // opens strictly below the 16:9 video player instead of fullscreen.
+    if (!PlatformBridge.isWeb) {
+      final bool launchedNativePartialTab =
+          await PlatformBridge.openPartialChromeCustomTab(
+        url: uri.toString(),
+        heightPx: heightPx,
+      );
+      if (launchedNativePartialTab) {
+        return;
+      }
+    }
+
+    // 2. Fallback to flutter_custom_tabs with PartialCustomTabsConfiguration
     final sheetHeight = calculateBelowPlayerHeight(context);
-    final screenWidth = MediaQuery.of(context).size.width;
 
     try {
       await custom_tabs.launchUrl(
@@ -109,12 +135,11 @@ class MiniChromeBrowserService {
           closeButton: custom_tabs.CustomTabsCloseButton(
             icon: custom_tabs.CustomTabsCloseButtonIcons.back,
           ),
-          partial: custom_tabs.PartialCustomTabsConfiguration.adaptiveSheet(
+          partial: custom_tabs.PartialCustomTabsConfiguration(
             initialHeight: sheetHeight,
-            initialWidth: screenWidth,
             activityHeightResizeBehavior:
                 custom_tabs.CustomTabsActivityHeightResizeBehavior.fixed,
-            cornerRadius: 18,
+            cornerRadius: 20,
           ),
           browser: const custom_tabs.CustomTabsBrowserConfiguration(
             prefersDefaultBrowser: false,
