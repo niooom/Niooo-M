@@ -207,28 +207,19 @@ class _HomeMoviesPageState extends State<HomeMoviesPage> {
                     width: 38,
                     height: 38,
                     decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      gradient: const LinearGradient(
-                        begin: Alignment.topLeft,
-                        end: Alignment.bottomRight,
-                        colors: [
-                          Color(0xFF00E676),
-                          Color(0xFF10B981),
-                          Color(0xFF047857),
-                        ],
-                      ),
+                      borderRadius: BorderRadius.circular(10),
                       boxShadow: [
                         BoxShadow(
                           color:
-                              const Color(0xFF00E676).withValues(alpha: 0.4),
-                          blurRadius: 14,
+                              const Color(0xFF00E676).withValues(alpha: 0.35),
+                          blurRadius: 12,
                         ),
                       ],
                     ),
-                    child: const Icon(
-                      Icons.movie_filter_rounded,
-                      color: Color(0xFF03120D),
-                      size: 21,
+                    clipBehavior: Clip.antiAlias,
+                    child: Image.asset(
+                      "assets/app_icon.png",
+                      fit: BoxFit.cover,
                     ),
                   ),
                   const SizedBox(width: 10),

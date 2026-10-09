@@ -122,22 +122,23 @@ class _WelcomePageState extends State<WelcomePage>
                                     ),
                                     child: Center(
                                       child: Container(
-                                        width: 76,
-                                        height: 76,
-                                        decoration: const BoxDecoration(
-                                          shape: BoxShape.circle,
-                                          gradient: LinearGradient(
-                                            colors: [
-                                              Color(0xFF00E676),
-                                              Color(0xFF10B981),
-                                              Color(0xFF047857),
-                                            ],
-                                          ),
+                                        width: 82,
+                                        height: 82,
+                                        decoration: BoxDecoration(
+                                          borderRadius:
+                                              BorderRadius.circular(20),
+                                          boxShadow: [
+                                            BoxShadow(
+                                              color: const Color(0xFF00E676)
+                                                  .withValues(alpha: 0.35),
+                                              blurRadius: 16,
+                                            ),
+                                          ],
                                         ),
-                                        child: const Icon(
-                                          Icons.movie_filter_rounded,
-                                          color: Color(0xFF03120D),
-                                          size: 36,
+                                        clipBehavior: Clip.antiAlias,
+                                        child: Image.asset(
+                                          "assets/app_icon.png",
+                                          fit: BoxFit.cover,
                                         ),
                                       ),
                                     ),

@@ -110,6 +110,24 @@ jobs:
           mkdir -p android/app/src/main/cpp
           cp -r /tmp/niooom_cpp_backup/* android/app/src/main/cpp/
 
+          # Replace default Flutter launcher icons with our custom uploaded Niooo M app icon (`assets/app_icon.png`)
+          # Removes any default adaptive XML icons (`mipmap-anydpi-v26`) and generates crisp PNGs for every Android density
+          if [ -f assets/app_icon.png ]; then
+            rm -rf android/app/src/main/res/mipmap-anydpi-v26
+            for spec in "mipmap-mdpi:48" "mipmap-hdpi:72" "mipmap-xhdpi:96" "mipmap-xxhdpi:144" "mipmap-xxxhdpi:192"; do
+              folder="${spec%%:*}"
+              dim="${spec##*:}"
+              mkdir -p "android/app/src/main/res/$folder"
+              if command -v convert >/dev/null 2>&1; then
+                convert assets/app_icon.png -resize "${dim}x${dim}" "android/app/src/main/res/$folder/ic_launcher.png"
+                convert assets/app_icon.png -resize "${dim}x${dim}" "android/app/src/main/res/$folder/ic_launcher_round.png"
+              else
+                cp assets/app_icon.png "android/app/src/main/res/$folder/ic_launcher.png"
+                cp assets/app_icon.png "android/app/src/main/res/$folder/ic_launcher_round.png"
+              fi
+            done
+          fi
+
           if [ -f android/settings.gradle.kts ]; then
             sed -i 's/id("org.jetbrains.kotlin.android") version "[^"]*"/id("org.jetbrains.kotlin.android") version "2.1.0"/g' android/settings.gradle.kts
           fi
