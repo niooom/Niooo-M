@@ -139,19 +139,6 @@ class PlatformBridge {
     return null;
   }
 
-  static Widget buildInteractiveDownloadCustomTab({
-    required String initialUrl,
-    required String viewType,
-    required void Function(String url) onUrlChanged,
-    required void Function(
-      String detectedDownloadUrl,
-      String userAgent,
-      String cookies,
-    ) onDownloadTriggeredInTab,
-  }) {
-    return HtmlElementView(viewType: viewType);
-  }
-
   /// Strictly runs only when a real download is triggered inside the Custom Tab.
   static Future<void> startRealVideoDownload({
     required String movieId,

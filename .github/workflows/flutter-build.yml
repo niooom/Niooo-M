@@ -318,6 +318,7 @@ jobs:
               private var lastActiveDownloadId: Long = -1L
               private var lastBytesSample: Long = 0L
               private var lastTimeSampleMs: Long = 0L
+              private var downloadMonitorStartMs: Long = 0L
 
               companion object {
                   init {
@@ -459,13 +460,19 @@ jobs:
                       if (lastActiveDownloadId > 0L) {
                           query.setFilterById(lastActiveDownloadId)
                       }
-                      val cursor: Cursor = dm.query(query) ?: return null
-                      cursor.use { c ->
-                          if (c.moveToFirst()) {
+                      val cursor: Cursor? = dm.query(query)
+                      cursor?.use { c ->
+                          while (c.moveToNext()) {
                               val statusIdx = c.getColumnIndex(DownloadManager.COLUMN_STATUS)
                               val dlIdx = c.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
                               val totIdx = c.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
                               val uriIdx = c.getColumnIndex(DownloadManager.COLUMN_LOCAL_URI)
+                              val modIdx = c.getColumnIndex(DownloadManager.COLUMN_LAST_MODIFIED_TIMESTAMP)
+
+                              val lastModMs = if (modIdx >= 0) c.getLong(modIdx) else System.currentTimeMillis()
+                              if (lastActiveDownloadId <= 0L && downloadMonitorStartMs > 0L && lastModMs + 5000L < downloadMonitorStartMs) {
+                                  continue
+                              }
 
                               val rawStatus = if (statusIdx >= 0) c.getInt(statusIdx) else 0
                               val dlBytes = if (dlIdx >= 0) c.getLong(dlIdx).coerceAtLeast(0L) else 0L
@@ -491,19 +498,63 @@ jobs:
                                   else -> "idle"
                               }
 
-                              val speedStr = if (speedMbps > 0.05) {
-                                  String.format("%.1f MB/s · C++ Engine", speedMbps)
-                              } else {
-                                  "C++ Engine"
-                              }
+                              if (mappedStatus == "downloading" || mappedStatus == "completed") {
+                                  val speedStr = if (speedMbps > 0.05) {
+                                      String.format("%.1f MB/s · C++ Engine", speedMbps)
+                                  } else {
+                                      "C++ Engine"
+                                  }
 
-                              return mapOf(
-                                  "status" to mappedStatus,
-                                  "downloadedBytes" to dlBytes,
-                                  "totalBytes" to totBytes,
-                                  "localPath" to localPath,
-                                  "speedLabel" to speedStr
-                              )
+                                  return mapOf(
+                                      "status" to mappedStatus,
+                                      "downloadedBytes" to dlBytes,
+                                      "totalBytes" to totBytes,
+                                      "localPath" to localPath,
+                                      "speedLabel" to speedStr
+                                  )
+                              }
+                          }
+                      }
+
+                      // Also check public Downloads directory for active Chrome Custom Tab `.crdownload` or `.mp4`/`.mkv` files
+                      val pubDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                      if (pubDir != null && pubDir.exists()) {
+                          val files = pubDir.listFiles()
+                          if (files != null) {
+                              val recentFile = files.filter { f ->
+                                  f.isFile &&
+                                  (downloadMonitorStartMs <= 0L || f.lastModified() >= downloadMonitorStartMs - 3000L) &&
+                                  (f.name.endsWith(".crdownload", ignoreCase = true) ||
+                                   f.name.endsWith(".mp4", ignoreCase = true) ||
+                                   f.name.endsWith(".mkv", ignoreCase = true))
+                              }.maxByOrNull { it.lastModified() }
+
+                              if (recentFile != null) {
+                                  val dlBytes = recentFile.length().coerceAtLeast(0L)
+                                  if (dlBytes > 0L) {
+                                      val isDownloading = recentFile.name.endsWith(".crdownload", ignoreCase = true)
+                                      val nowMs = System.currentTimeMillis()
+                                      val elapsedSec = ((nowMs - lastTimeSampleMs).coerceAtLeast(200L)) / 1000.0
+                                      val deltaBytes = (dlBytes - lastBytesSample).coerceAtLeast(0L)
+                                      val speedMbps = (deltaBytes / (1024.0 * 1024.0)) / elapsedSec
+                                      lastBytesSample = dlBytes
+                                      lastTimeSampleMs = nowMs
+
+                                      val speedStr = if (speedMbps > 0.05) {
+                                          String.format("%.1f MB/s · C++ Engine", speedMbps)
+                                      } else {
+                                          "C++ Engine"
+                                      }
+
+                                      return mapOf(
+                                          "status" to if (isDownloading) "downloading" else "completed",
+                                          "downloadedBytes" to dlBytes,
+                                          "totalBytes" to if (isDownloading) 0L else dlBytes,
+                                          "localPath" to recentFile.absolutePath,
+                                          "speedLabel" to speedStr
+                                      )
+                                  }
+                              }
                           }
                       }
                   } catch (_: Throwable) {
@@ -579,6 +630,9 @@ jobs:
                                   result.success(dlId)
                               }
                               "pollSystemActiveDownload" -> {
+                                  if (downloadMonitorStartMs == 0L) {
+                                      downloadMonitorStartMs = System.currentTimeMillis()
+                                  }
                                   val info = queryActiveSystemDownload()
                                   result.success(info)
                               }

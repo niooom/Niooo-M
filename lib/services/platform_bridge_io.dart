@@ -6,7 +6,6 @@ import "package:flutter/material.dart";
 import "package:flutter/services.dart";
 import "package:video_player/video_player.dart";
 import "package:wakelock_plus/wakelock_plus.dart";
-import "package:webview_flutter/webview_flutter.dart";
 import "native_cpp_engine.dart";
 
 class PlatformBridge {
@@ -457,8 +456,8 @@ class PlatformBridge {
     } catch (_) {}
   }
 
-  /// Queries Android's native `DownloadManager` (via `MainActivity.kt`) to check if the user
-  /// started an active download inside an external Chrome Custom Tab.
+  /// Queries Android's native `DownloadManager` & Chrome Downloads directory (via `MainActivity.kt`)
+  /// to detect in real time when the user starts a download inside the Google Chrome Custom Tab.
   static Future<Map<String, dynamic>?> pollSystemActiveDownload(
     String apiDownloadUrl,
   ) async {
@@ -475,32 +474,11 @@ class PlatformBridge {
   }
 
   // ===========================================================================
-  // SECTION 3: INTERACTIVE CUSTOM CHROME TAB WITH REAL-TIME DOWNLOAD DETECTION
-  //            & C++17 HIGH-SPEED BINARY DOWNLOAD ENGINE
+  // SECTION 3: REAL-TIME CHROME CUSTOM TAB DOWNLOAD ENGINE (C++17)
   // ===========================================================================
 
-  /// Builds the interactive Custom Chrome Tab browser widget below the video player.
-  /// Allows the user to view ads and interact with the download page normally, and
-  /// detects in real time when the user actually clicks the Download button on the page!
-  static Widget buildInteractiveDownloadCustomTab({
-    required String initialUrl,
-    required String viewType,
-    required void Function(String url) onUrlChanged,
-    required void Function(
-      String detectedDownloadUrl,
-      String userAgent,
-      String cookies,
-    ) onDownloadTriggeredInTab,
-  }) {
-    return _AndroidCustomTabWebViewDetector(
-      initialUrl: initialUrl,
-      onUrlChanged: onUrlChanged,
-      onDownloadTriggeredInTab: onDownloadTriggeredInTab,
-    );
-  }
-
-  /// Starts a REAL binary download strictly after the user has clicked the Download button
-  /// inside the Custom Tab (or tapped Retry). Zero fake/demo simulation!
+  /// Starts a REAL binary download strictly after the user has triggered the download
+  /// inside the Chrome Custom Tab (or tapped Retry). Zero fake/demo simulation!
   static Future<void> startRealVideoDownload({
     required String movieId,
     required String title,
@@ -566,8 +544,6 @@ class PlatformBridge {
         return;
       }
 
-      // If direct HTTP stream was blocked by Cloudflare cookies, enqueue in Android's native
-      // System DownloadManager with the Custom Tab's cookies & User-Agent and track real bytes!
       final bool systemEnqueued = await _enqueueAndTrackAndroidSystemDownload(
         movieId: movieId,
         title: title,
@@ -582,13 +558,13 @@ class PlatformBridge {
       if (!systemEnqueued && _cancelledDownloads[movieId] != true) {
         cancelDownloadNotification(movieId);
         onError(
-          "Please complete the steps inside the Custom Tab and tap the Download button on the page.",
+          "Please complete the steps inside the Chrome Custom Tab and tap the Download button on the page.",
         );
       }
     } catch (e) {
       if (_cancelledDownloads[movieId] == true) return;
       cancelDownloadNotification(movieId);
-      onError("Download interrupted. Tap Retry or use the Custom Tab.");
+      onError("Download interrupted. Tap Retry or use the Chrome Custom Tab.");
     } finally {
       NativeCppEngine.finishDownloadSession(movieId);
     }
@@ -622,7 +598,6 @@ class PlatformBridge {
       );
       if (enqueueRes == null) return false;
 
-      // Poll real bytes from Android System DownloadManager
       for (int attempt = 0; attempt < 3600; attempt++) {
         if (_cancelledDownloads[movieId] == true) {
           cancelDownloadNotification(movieId);
@@ -1087,190 +1062,6 @@ class PlatformBridge {
       final pos = videoObj.value.position;
       videoObj.seekTo(pos);
     }
-  }
-}
-
-/// Interactive Custom Chrome Tab WebView that renders the API `download_url` page
-/// (including its ads & countdowns) and detects in real time ONLY when the user clicks
-/// the actual download button on the page (`get_video?`, `dl=1`, `.mp4`/`.mkv`, or JS click).
-class _AndroidCustomTabWebViewDetector extends StatefulWidget {
-  final String initialUrl;
-  final void Function(String url) onUrlChanged;
-  final void Function(
-    String detectedDownloadUrl,
-    String userAgent,
-    String cookies,
-  ) onDownloadTriggeredInTab;
-
-  const _AndroidCustomTabWebViewDetector({
-    required this.initialUrl,
-    required this.onUrlChanged,
-    required this.onDownloadTriggeredInTab,
-  });
-
-  @override
-  State<_AndroidCustomTabWebViewDetector> createState() =>
-      _AndroidCustomTabWebViewDetectorState();
-}
-
-class _AndroidCustomTabWebViewDetectorState
-    extends State<_AndroidCustomTabWebViewDetector> {
-  late final WebViewController _controller;
-  bool _isLoading = true;
-  bool _hasTriggeredDownload = false;
-  static const String _defaultUa =
-      "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
-
-  bool _isRealBinaryDownloadLink(String rawUrl) {
-    final lower = rawUrl.toLowerCase();
-    if (!lower.startsWith("http://") && !lower.startsWith("https://")) {
-      return false;
-    }
-    // Never treat the initial `/v/` or `/e/` page load itself as a binary download trigger
-    if (rawUrl == widget.initialUrl) {
-      return false;
-    }
-    if (lower.contains("get_video?") && lower.contains("token=")) {
-      return true;
-    }
-    if (lower.contains("dl=1") || lower.contains("download=1")) {
-      return true;
-    }
-    final uri = Uri.tryParse(rawUrl);
-    final path = uri?.path.toLowerCase() ?? "";
-    if (!path.contains("/v/") &&
-        !path.contains("/e/") &&
-        (path.endsWith(".mp4") ||
-            path.endsWith(".mkv") ||
-            path.endsWith(".webm") ||
-            path.endsWith(".avi"))) {
-      return true;
-    }
-    return false;
-  }
-
-  Future<void> _emitDetectedDownload(String targetUrl) async {
-    if (_hasTriggeredDownload) return;
-    _hasTriggeredDownload = true;
-
-    String cookies = "";
-    try {
-      final rawCookie = await _controller
-          .runJavaScriptReturningResult("document.cookie")
-          .timeout(const Duration(seconds: 2));
-      cookies = rawCookie.toString().replaceAll('"', '').trim();
-    } catch (_) {}
-
-    widget.onDownloadTriggeredInTab(targetUrl, _defaultUa, cookies);
-  }
-
-  Future<void> _injectDownloadButtonHook() async {
-    const String jsHook = """
-      (function() {
-        if (window.__nioooDownloadHookInstalled) return;
-        window.__nioooDownloadHookInstalled = true;
-
-        function resolveFullUrl(raw) {
-          if (!raw) return '';
-          if (raw.startsWith('//')) return 'https:' + raw;
-          if (raw.startsWith('/')) return window.location.origin + raw;
-          return raw;
-        }
-
-        document.addEventListener('click', function(e) {
-          var el = e.target ? e.target.closest('a, button, #downloadvideo, .download-btn, [id*="download"]') : null;
-          if (!el) return;
-
-          var href = el.getAttribute('href') || el.href || '';
-          if (href && (href.indexOf('get_video?') !== -1 || href.indexOf('dl=1') !== -1)) {
-            e.preventDefault();
-            NioooDownloadBridge.postMessage(resolveFullUrl(href));
-            return;
-          }
-
-          var robot = document.getElementById('robotlink') || document.getElementById('ideoolink') || document.getElementById('botlink');
-          if (robot && (el.id === 'downloadvideo' || (el.className && el.className.toString().indexOf('download') !== -1))) {
-            var txt = (robot.innerText || robot.textContent || '').trim();
-            if (txt && txt.indexOf('get_video?') !== -1) {
-              var full = resolveFullUrl(txt);
-              if (full.indexOf('dl=1') === -1) {
-                full += (full.indexOf('?') !== -1 ? '&dl=1' : '?dl=1');
-              }
-              NioooDownloadBridge.postMessage(full);
-            }
-          }
-        }, true);
-      })();
-    """;
-    try {
-      await _controller.runJavaScript(jsHook);
-    } catch (_) {}
-  }
-
-  @override
-  void initState() {
-    super.initState();
-    _controller = WebViewController()
-      ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..setBackgroundColor(const Color(0xFF050D0A))
-      ..setUserAgent(_defaultUa)
-      ..addJavaScriptChannel(
-        "NioooDownloadBridge",
-        onMessageReceived: (JavaScriptMessage message) {
-          final msg = message.message.trim();
-          if (msg.startsWith("http")) {
-            _emitDetectedDownload(msg);
-          }
-        },
-      )
-      ..setNavigationDelegate(
-        NavigationDelegate(
-          onPageStarted: (url) {
-            if (!mounted) return;
-            setState(() => _isLoading = true);
-            widget.onUrlChanged(url);
-            if (_isRealBinaryDownloadLink(url)) {
-              _emitDetectedDownload(url);
-            }
-          },
-          onPageFinished: (url) {
-            if (!mounted) return;
-            setState(() => _isLoading = false);
-            widget.onUrlChanged(url);
-            _injectDownloadButtonHook();
-          },
-          onNavigationRequest: (NavigationRequest request) {
-            final reqUrl = request.url.trim();
-            if (_isRealBinaryDownloadLink(reqUrl)) {
-              _emitDetectedDownload(reqUrl);
-              return NavigationDecision.prevent;
-            }
-            return NavigationDecision.navigate;
-          },
-        ),
-      )
-      ..loadRequest(Uri.parse(widget.initialUrl));
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Stack(
-      fit: StackFit.expand,
-      children: [
-        WebViewWidget(controller: _controller),
-        if (_isLoading)
-          const Positioned(
-            top: 0,
-            left: 0,
-            right: 0,
-            child: LinearProgressIndicator(
-              minHeight: 2.5,
-              backgroundColor: Colors.transparent,
-              color: Color(0xFF00E676),
-            ),
-          ),
-      ],
-    );
   }
 }
 
