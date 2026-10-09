@@ -319,10 +319,10 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
   }
 
   /// Triggered when the user taps the Download button:
-  /// Strictly uses ONLY the `download_url` provided by the Niooo M API Key (`movie.downloadUrl`).
-  /// Never uses the extracted direct stream link (`stream_url` / `/e/`), which is strictly for video playback only.
-  /// 1. Starts the Native C++17 High-Speed Download Engine & real-time progress bar (`WatchHistoryDownloadService`).
-  /// 2. Opens the exact API `download_url` inside the integrated Custom Chrome Tab (`MiniChromeBrowserService`) right below the video player.
+  /// Does NOT start any premature or demo download when clicked!
+  /// Instead, it opens the API `download_url` inside the integrated Custom Chrome Tab below the player
+  /// so the user can view the page/ads and click the Download button inside the Custom Tab.
+  /// Real-time download tracking begins ONLY when the user triggers the download inside the Custom Tab!
   void _handleDownloadMovieTap() {
     final movie = widget.movie;
     final String apiDownloadLink = movie.downloadUrl.trim();
@@ -345,8 +345,10 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
       return;
     }
 
-    // 1. Start Niooo M C++17 Download Engine & Android Notification Progress using ONLY the API download_url
-    WatchHistoryDownloadService.instance.startMovieDownload(
+    // Open the API download_url inside our Custom Chrome Tab with real-time download detection.
+    // No download or progress bar starts until the user clicks Download inside the Custom Tab!
+    MiniChromeBrowserService.openDownloadPortalBelowPlayer(
+      context,
       movieId: movie.id,
       title: movie.title,
       posterUrl: movie.posterUrl,
@@ -355,13 +357,6 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
       language: movie.language,
       apiDownloadUrl: apiDownloadLink,
       estimatedSizeBytes: movie.sizeBytes,
-    );
-
-    // 2. Open the exact API download_url inside our integrated Custom Chrome Tab below the video player
-    MiniChromeBrowserService.openAdUrlBelowPlayer(
-      context,
-      apiDownloadLink,
-      title: "Download · ${movie.title}",
     );
   }
 

@@ -211,6 +211,28 @@ class DownloadTaskItem {
   }
 }
 
+class _PendingCustomTabDownloadContext {
+  final String movieId;
+  final String title;
+  final String posterUrl;
+  final String backdropUrl;
+  final String qualityBadge;
+  final String language;
+  final String apiDownloadUrl;
+  final int estimatedSizeBytes;
+
+  const _PendingCustomTabDownloadContext({
+    required this.movieId,
+    required this.title,
+    required this.posterUrl,
+    required this.backdropUrl,
+    required this.qualityBadge,
+    required this.language,
+    required this.apiDownloadUrl,
+    required this.estimatedSizeBytes,
+  });
+}
+
 class WatchHistoryDownloadService extends ChangeNotifier {
   static final WatchHistoryDownloadService instance =
       WatchHistoryDownloadService._();
@@ -224,6 +246,9 @@ class WatchHistoryDownloadService extends ChangeNotifier {
 
   final Map<String, WatchHistoryRecord> _historyById = {};
   final Map<String, DownloadTaskItem> _downloadsById = {};
+  final Map<String, _PendingCustomTabDownloadContext> _pendingCustomTabById = {};
+  String? _activeCustomTabMovieId;
+  Timer? _systemDownloadPollTimer;
   DateTime? _lastDiskSaveTime;
 
   List<WatchHistoryRecord> get historyList {
@@ -297,6 +322,7 @@ class WatchHistoryDownloadService extends ChangeNotifier {
               final task =
                   DownloadTaskItem.fromJson(Map<String, dynamic>.from(item));
               if (task.movieId.isNotEmpty) {
+                // Only keep real completed or explicitly paused tasks on disk load
                 final normalized = task.isDownloading
                     ? task.copyWith(status: "paused", speedLabel: "Tap to resume")
                     : task;
@@ -379,9 +405,183 @@ class WatchHistoryDownloadService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Starts or resumes a high-speed download strictly using ONLY the `download_url`
-  /// provided by the Niooo M API Key (`apiDownloadUrl`) and the Native C++17 Download Engine.
-  /// Never uses the video player's extracted direct stream link.
+  /// Registers the movie metadata when the user opens the Custom Chrome Tab for downloading,
+  /// WITHOUT starting any download or showing any fake/demo progress bar.
+  /// Also starts monitoring Android System `DownloadManager` in case the user starts a download
+  /// in the external Chrome Custom Tab.
+  void preparePendingCustomTabDownload({
+    required String movieId,
+    required String title,
+    required String posterUrl,
+    required String backdropUrl,
+    required String qualityBadge,
+    required String language,
+    required String apiDownloadUrl,
+    required int estimatedSizeBytes,
+  }) {
+    _pendingCustomTabById[movieId] = _PendingCustomTabDownloadContext(
+      movieId: movieId,
+      title: title,
+      posterUrl: posterUrl,
+      backdropUrl: backdropUrl,
+      qualityBadge: qualityBadge,
+      language: language,
+      apiDownloadUrl: apiDownloadUrl.trim(),
+      estimatedSizeBytes: estimatedSizeBytes,
+    );
+    _activeCustomTabMovieId = movieId;
+    _startSystemDownloadManagerMonitor();
+  }
+
+  void _startSystemDownloadManagerMonitor() {
+    _systemDownloadPollTimer?.cancel();
+    _systemDownloadPollTimer = Timer.periodic(
+      const Duration(milliseconds: 650),
+      (timer) async {
+        final activeId = _activeCustomTabMovieId;
+        if (activeId == null) {
+          timer.cancel();
+          return;
+        }
+        final pending = _pendingCustomTabById[activeId];
+        if (pending == null) return;
+
+        final sysDownload =
+            await PlatformBridge.pollSystemActiveDownload(pending.apiDownloadUrl);
+        if (sysDownload == null) return;
+
+        final String status = (sysDownload["status"] ?? "").toString();
+        final int downloadedBytes =
+            int.tryParse((sysDownload["downloadedBytes"] ?? "0").toString()) ??
+                0;
+        final int totalBytes =
+            int.tryParse((sysDownload["totalBytes"] ?? "0").toString()) ??
+                pending.estimatedSizeBytes;
+        final String localPath =
+            (sysDownload["localPath"] ?? "").toString();
+        final String speedLabel =
+            (sysDownload["speedLabel"] ?? "C++ Engine").toString();
+
+        if (status == "downloading" && downloadedBytes > 0) {
+          final int effectiveTotal = totalBytes > 0
+              ? totalBytes
+              : (pending.estimatedSizeBytes > 0
+                  ? pending.estimatedSizeBytes
+                  : 320 * 1024 * 1024);
+          final double ratio =
+              (downloadedBytes / effectiveTotal).clamp(0.01, 0.99);
+          final int pct = (ratio * 100).round().clamp(1, 99);
+
+          final updated = DownloadTaskItem(
+            movieId: pending.movieId,
+            title: pending.title,
+            posterUrl: pending.posterUrl,
+            backdropUrl: pending.backdropUrl,
+            qualityBadge: pending.qualityBadge,
+            language: pending.language,
+            apiDownloadUrl: pending.apiDownloadUrl,
+            localFilePath: localPath,
+            status: "downloading",
+            downloadedBytes: downloadedBytes,
+            totalBytes: effectiveTotal,
+            progress: ratio,
+            speedLabel: speedLabel,
+            updatedAtMs: DateTime.now().millisecondsSinceEpoch,
+          );
+          _downloadsById[pending.movieId] = updated;
+          notifyListeners();
+
+          final dlMb = (downloadedBytes / (1024 * 1024)).toStringAsFixed(1);
+          final totMb = (effectiveTotal / (1024 * 1024)).toStringAsFixed(1);
+          PlatformBridge.showDownloadNotification(
+            movieId: pending.movieId,
+            title: "Downloading: ${pending.title}",
+            body: "$pct% · $dlMb MB / $totMb MB ($speedLabel)",
+            progress: pct,
+            isOngoing: true,
+          );
+        } else if (status == "completed" && downloadedBytes > 0) {
+          final int finalTotal =
+              totalBytes > 0 ? totalBytes : downloadedBytes;
+          final completed = DownloadTaskItem(
+            movieId: pending.movieId,
+            title: pending.title,
+            posterUrl: pending.posterUrl,
+            backdropUrl: pending.backdropUrl,
+            qualityBadge: pending.qualityBadge,
+            language: pending.language,
+            apiDownloadUrl: pending.apiDownloadUrl,
+            localFilePath: localPath,
+            status: "completed",
+            downloadedBytes: finalTotal,
+            totalBytes: finalTotal,
+            progress: 1.0,
+            speedLabel: "Downloaded via C++ Engine",
+            updatedAtMs: DateTime.now().millisecondsSinceEpoch,
+          );
+          _downloadsById[pending.movieId] = completed;
+          _saveDownloadsToStorage();
+          notifyListeners();
+
+          final totMb = (finalTotal / (1024 * 1024)).toStringAsFixed(1);
+          PlatformBridge.showDownloadNotification(
+            movieId: pending.movieId,
+            title: "Download Complete: ${pending.title}",
+            body: "Saved offline ($totMb MB) · Tap to watch",
+            progress: 100,
+            isOngoing: false,
+          );
+          timer.cancel();
+        }
+      },
+    );
+  }
+
+  /// Called automatically when the integrated Custom Tab intercepts the real binary download URL
+  /// AFTER the user has viewed ads and clicked the Download button inside the Custom Tab!
+  Future<void> onCustomTabDownloadDetected({
+    required String movieId,
+    required String detectedDownloadUrl,
+    String userAgent = "",
+    String cookies = "",
+  }) async {
+    final pending = _pendingCustomTabById[movieId];
+    final existing = _downloadsById[movieId];
+    if (existing != null && existing.isDownloading) {
+      return;
+    }
+
+    final String title = pending?.title ?? existing?.title ?? "Movie Download";
+    final String posterUrl = pending?.posterUrl ?? existing?.posterUrl ?? "";
+    final String backdropUrl =
+        pending?.backdropUrl ?? existing?.backdropUrl ?? "";
+    final String qualityBadge =
+        pending?.qualityBadge ?? existing?.qualityBadge ?? "HD";
+    final String language =
+        pending?.language ?? existing?.language ?? "Hindi";
+    final String apiDownloadUrl =
+        pending?.apiDownloadUrl ?? existing?.apiDownloadUrl ?? detectedDownloadUrl;
+    final int estimatedSizeBytes = pending?.estimatedSizeBytes ??
+        existing?.totalBytes ??
+        (320 * 1024 * 1024);
+
+    await startMovieDownload(
+      movieId: movieId,
+      title: title,
+      posterUrl: posterUrl,
+      backdropUrl: backdropUrl,
+      qualityBadge: qualityBadge,
+      language: language,
+      apiDownloadUrl: apiDownloadUrl,
+      detectedDirectDownloadUrl: detectedDownloadUrl,
+      userAgent: userAgent,
+      cookies: cookies,
+      estimatedSizeBytes: estimatedSizeBytes,
+    );
+  }
+
+  /// Starts or resumes a real-time download ONLY after the download has been triggered
+  /// inside the Custom Tab (or when the user taps Retry on an already-triggered download).
   Future<void> startMovieDownload({
     required String movieId,
     required String title,
@@ -391,6 +591,9 @@ class WatchHistoryDownloadService extends ChangeNotifier {
     required String language,
     required String apiDownloadUrl,
     required int estimatedSizeBytes,
+    String? detectedDirectDownloadUrl,
+    String userAgent = "",
+    String cookies = "",
   }) async {
     final existing = _downloadsById[movieId];
     if (existing != null && existing.isDownloading) {
@@ -398,7 +601,13 @@ class WatchHistoryDownloadService extends ChangeNotifier {
     }
 
     final cleanApiDownloadUrl = apiDownloadUrl.trim();
-    if (cleanApiDownloadUrl.isEmpty) {
+    final effectiveDownloadTarget =
+        (detectedDirectDownloadUrl != null &&
+                detectedDirectDownloadUrl.trim().isNotEmpty)
+            ? detectedDirectDownloadUrl.trim()
+            : cleanApiDownloadUrl;
+
+    if (effectiveDownloadTarget.isEmpty) {
       return;
     }
 
@@ -415,13 +624,15 @@ class WatchHistoryDownloadService extends ChangeNotifier {
       backdropUrl: backdropUrl,
       qualityBadge: qualityBadge,
       language: language,
-      apiDownloadUrl: cleanApiDownloadUrl,
+      apiDownloadUrl: cleanApiDownloadUrl.isNotEmpty
+          ? cleanApiDownloadUrl
+          : effectiveDownloadTarget,
       localFilePath: existing?.localFilePath ?? "",
       status: "downloading",
-      downloadedBytes: (effectiveTotalBytes * 0.01).round(),
+      downloadedBytes: 0,
       totalBytes: effectiveTotalBytes,
-      progress: 0.01,
-      speedLabel: "Starting C++ Engine...",
+      progress: 0.0,
+      speedLabel: "Connecting C++ Engine...",
       updatedAtMs: DateTime.now().millisecondsSinceEpoch,
     );
 
@@ -432,20 +643,24 @@ class WatchHistoryDownloadService extends ChangeNotifier {
     PlatformBridge.showDownloadNotification(
       movieId: movieId,
       title: "Downloading: $title",
-      body: "1% · Starting C++ High-Speed Download via API Link",
-      progress: 1,
+      body: "Starting real-time download from Custom Tab...",
+      progress: 0,
       isOngoing: true,
     );
 
     await PlatformBridge.startRealVideoDownload(
       movieId: movieId,
       title: title,
-      apiDownloadUrl: cleanApiDownloadUrl,
+      apiDownloadUrl: effectiveDownloadTarget,
+      userAgent: userAgent,
+      cookies: cookies,
       estimatedBytes: effectiveTotalBytes,
       onProgress: (downloadedBytes, totalBytes, progressRatio, speedText, localPath) {
-        final double pct = progressRatio.clamp(0.01, 1.0);
+        final double pct = progressRatio.clamp(0.0, 1.0);
         final updated = (_downloadsById[movieId] ?? initialTask).copyWith(
-          apiDownloadUrl: cleanApiDownloadUrl,
+          apiDownloadUrl: cleanApiDownloadUrl.isNotEmpty
+              ? cleanApiDownloadUrl
+              : effectiveDownloadTarget,
           localFilePath: localPath,
           status: "downloading",
           downloadedBytes: downloadedBytes,
@@ -460,7 +675,9 @@ class WatchHistoryDownloadService extends ChangeNotifier {
       },
       onCompleted: (localPath, totalBytes) {
         final completed = (_downloadsById[movieId] ?? initialTask).copyWith(
-          apiDownloadUrl: cleanApiDownloadUrl,
+          apiDownloadUrl: cleanApiDownloadUrl.isNotEmpty
+              ? cleanApiDownloadUrl
+              : effectiveDownloadTarget,
           localFilePath: localPath,
           status: "completed",
           downloadedBytes: totalBytes,
@@ -477,7 +694,7 @@ class WatchHistoryDownloadService extends ChangeNotifier {
       onError: (errMsg) {
         final failed = (_downloadsById[movieId] ?? initialTask).copyWith(
           status: "failed",
-          speedLabel: "Tap Retry",
+          speedLabel: "Open Custom Tab to Download",
           errorMessage: errMsg,
           updatedAtMs: DateTime.now().millisecondsSinceEpoch,
         );
@@ -495,6 +712,7 @@ class WatchHistoryDownloadService extends ChangeNotifier {
       localFilePath: existing?.localFilePath,
     );
     _downloadsById.remove(movieId);
+    _pendingCustomTabById.remove(movieId);
     _saveDownloadsToStorage();
     notifyListeners();
   }

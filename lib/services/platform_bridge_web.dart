@@ -11,7 +11,7 @@ import "package:flutter/material.dart";
 class PlatformBridge {
   static bool get isWeb => true;
 
-  static final Map<String, Timer> _webDownloadTimers = {};
+  static final Map<String, html.HttpRequest> _activeWebRequests = {};
 
   static Future<String> httpGetString(
     String url, {
@@ -133,12 +133,32 @@ class PlatformBridge {
 
   static void cancelDownloadNotification(String movieId) {}
 
-  /// Strictly uses ONLY the `apiDownloadUrl` from the Niooo M API Key
-  /// (never calls `/api/streamtape/direct` or the video stream extractor).
+  static Future<Map<String, dynamic>?> pollSystemActiveDownload(
+    String apiDownloadUrl,
+  ) async {
+    return null;
+  }
+
+  static Widget buildInteractiveDownloadCustomTab({
+    required String initialUrl,
+    required String viewType,
+    required void Function(String url) onUrlChanged,
+    required void Function(
+      String detectedDownloadUrl,
+      String userAgent,
+      String cookies,
+    ) onDownloadTriggeredInTab,
+  }) {
+    return HtmlElementView(viewType: viewType);
+  }
+
+  /// Strictly runs only when a real download is triggered inside the Custom Tab.
   static Future<void> startRealVideoDownload({
     required String movieId,
     required String title,
     required String apiDownloadUrl,
+    String userAgent = "",
+    String cookies = "",
     required int estimatedBytes,
     required void Function(
       int downloadedBytes,
@@ -150,7 +170,8 @@ class PlatformBridge {
     required void Function(String localPath, int totalBytes) onCompleted,
     required void Function(String errorMessage) onError,
   }) async {
-    _webDownloadTimers[movieId]?.cancel();
+    _activeWebRequests[movieId]?.abort();
+    _activeWebRequests.remove(movieId);
 
     final cleanApiUrl = apiDownloadUrl.trim();
     if (cleanApiUrl.isEmpty) {
@@ -158,34 +179,63 @@ class PlatformBridge {
       return;
     }
 
-    final int totalBytes =
-        estimatedBytes > 0 ? estimatedBytes : 320 * 1024 * 1024;
-    int currentBytes = (totalBytes * 0.02).round();
-    final int stepBytes = (totalBytes * 0.025).round();
+    try {
+      final req = html.HttpRequest();
+      _activeWebRequests[movieId] = req;
+      req.open("GET", cleanApiUrl, async: true);
+      req.responseType = "blob";
 
-    _webDownloadTimers[movieId] =
-        Timer.periodic(const Duration(milliseconds: 160), (timer) {
-      currentBytes += stepBytes;
-      if (currentBytes >= totalBytes) {
-        timer.cancel();
-        _webDownloadTimers.remove(movieId);
-        onCompleted(cleanApiUrl, totalBytes);
-      } else {
-        final double ratio = (currentBytes / totalBytes).clamp(0.01, 0.99);
-        onProgress(
-          currentBytes,
-          totalBytes,
-          ratio,
-          "18.4 MB/s · C++ Engine",
-          cleanApiUrl,
-        );
-      }
-    });
+      final int fallbackTotal =
+          estimatedBytes > 0 ? estimatedBytes : 320 * 1024 * 1024;
+      final DateTime startTime = DateTime.now();
+
+      req.onProgress.listen((html.ProgressEvent event) {
+        final int loaded = event.loaded ?? 0;
+        final int total =
+            (event.total != null && event.total! > 0) ? event.total! : fallbackTotal;
+        if (loaded > 0 && total > 0) {
+          final double ratio = (loaded / total).clamp(0.0, 0.99);
+          final double elapsedSec =
+              (DateTime.now().difference(startTime).inMilliseconds / 1000.0)
+                  .clamp(0.1, 86400.0);
+          final double mbps = (loaded / (1024 * 1024)) / elapsedSec;
+          onProgress(
+            loaded,
+            total,
+            ratio,
+            "${mbps.toStringAsFixed(1)} MB/s · C++ Engine",
+            cleanApiUrl,
+          );
+        }
+      });
+
+      final completer = Completer<void>();
+      req.onLoad.listen((_) {
+        _activeWebRequests.remove(movieId);
+        if (req.status != null && req.status! >= 200 && req.status! < 300) {
+          onCompleted(cleanApiUrl, fallbackTotal);
+        } else {
+          onError("Please use the Custom Tab page to complete the download.");
+        }
+        if (!completer.isCompleted) completer.complete();
+      });
+
+      req.onError.listen((_) {
+        _activeWebRequests.remove(movieId);
+        onError("Please use the Custom Tab page to complete the download.");
+        if (!completer.isCompleted) completer.complete();
+      });
+
+      req.send();
+      await completer.future;
+    } catch (_) {
+      onError("Please use the Custom Tab page to complete the download.");
+    }
   }
 
   static void cancelVideoDownload(String movieId, {String? localFilePath}) {
-    _webDownloadTimers[movieId]?.cancel();
-    _webDownloadTimers.remove(movieId);
+    _activeWebRequests[movieId]?.abort();
+    _activeWebRequests.remove(movieId);
   }
 
   static void playVideo(Object? videoObj, void Function() onMutedFallback) {

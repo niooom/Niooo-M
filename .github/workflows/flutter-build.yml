@@ -291,14 +291,18 @@ jobs:
           echo "$PKG_LINE" > "$MAIN_KT"
           cat << 'EOF' >> "$MAIN_KT"
 
+          import android.app.DownloadManager
           import android.app.NotificationChannel
           import android.app.NotificationManager
           import android.app.PendingIntent
           import android.content.Context
           import android.content.Intent
           import android.content.pm.ActivityInfo
+          import android.database.Cursor
+          import android.net.Uri
           import android.os.Build
           import android.os.Bundle
+          import android.os.Environment
           import android.view.View
           import android.view.WindowInsets
           import android.view.WindowInsetsController
@@ -311,6 +315,9 @@ jobs:
           class MainActivity : FlutterActivity() {
               private val CHANNEL = "com.niooo.m/player"
               private val DOWNLOAD_CHANNEL_ID = "niooo_m_downloads_channel"
+              private var lastActiveDownloadId: Long = -1L
+              private var lastBytesSample: Long = 0L
+              private var lastTimeSampleMs: Long = 0L
 
               companion object {
                   init {
@@ -410,6 +417,100 @@ jobs:
                   }
               }
 
+              private fun enqueueNativeDownload(
+                  url: String,
+                  title: String,
+                  userAgent: String,
+                  cookies: String
+              ): Long? {
+                  return try {
+                      val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                      val safeName = title.replace(Regex("[^a-zA-Z0-9._-]"), "_") + ".mp4"
+                      val req = DownloadManager.Request(Uri.parse(url))
+                          .setTitle(title)
+                          .setDescription("Niooo M Offline Video Download")
+                          .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                          .setAllowedOverMetered(true)
+                          .setAllowedOverRoaming(true)
+                          .setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, safeName)
+
+                      if (userAgent.isNotBlank()) {
+                          req.addRequestHeader("User-Agent", userAgent)
+                      }
+                      if (cookies.isNotBlank()) {
+                          req.addRequestHeader("Cookie", cookies)
+                      }
+                      req.addRequestHeader("Referer", "https://streamtape.com/")
+
+                      val id = dm.enqueue(req)
+                      lastActiveDownloadId = id
+                      lastBytesSample = 0L
+                      lastTimeSampleMs = System.currentTimeMillis()
+                      id
+                  } catch (_: Throwable) {
+                      null
+                  }
+              }
+
+              private fun queryActiveSystemDownload(): Map<String, Any>? {
+                  try {
+                      val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                      val query = DownloadManager.Query()
+                      if (lastActiveDownloadId > 0L) {
+                          query.setFilterById(lastActiveDownloadId)
+                      }
+                      val cursor: Cursor = dm.query(query) ?: return null
+                      cursor.use { c ->
+                          if (c.moveToFirst()) {
+                              val statusIdx = c.getColumnIndex(DownloadManager.COLUMN_STATUS)
+                              val dlIdx = c.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
+                              val totIdx = c.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
+                              val uriIdx = c.getColumnIndex(DownloadManager.COLUMN_LOCAL_URI)
+
+                              val rawStatus = if (statusIdx >= 0) c.getInt(statusIdx) else 0
+                              val dlBytes = if (dlIdx >= 0) c.getLong(dlIdx).coerceAtLeast(0L) else 0L
+                              val totBytes = if (totIdx >= 0) c.getLong(totIdx).coerceAtLeast(0L) else 0L
+                              val localUriStr = if (uriIdx >= 0) (c.getString(uriIdx) ?: "") else ""
+                              val localPath = if (localUriStr.startsWith("file://")) {
+                                  Uri.parse(localUriStr).path ?: localUriStr
+                              } else {
+                                  localUriStr
+                              }
+
+                              val nowMs = System.currentTimeMillis()
+                              val elapsedSec = ((nowMs - lastTimeSampleMs).coerceAtLeast(200L)) / 1000.0
+                              val deltaBytes = (dlBytes - lastBytesSample).coerceAtLeast(0L)
+                              val speedMbps = (deltaBytes / (1024.0 * 1024.0)) / elapsedSec
+                              lastBytesSample = dlBytes
+                              lastTimeSampleMs = nowMs
+
+                              val mappedStatus = when (rawStatus) {
+                                  DownloadManager.STATUS_RUNNING, DownloadManager.STATUS_PENDING -> "downloading"
+                                  DownloadManager.STATUS_SUCCESSFUL -> "completed"
+                                  DownloadManager.STATUS_FAILED -> "failed"
+                                  else -> "idle"
+                              }
+
+                              val speedStr = if (speedMbps > 0.05) {
+                                  String.format("%.1f MB/s · C++ Engine", speedMbps)
+                              } else {
+                                  "C++ Engine"
+                              }
+
+                              return mapOf(
+                                  "status" to mappedStatus,
+                                  "downloadedBytes" to dlBytes,
+                                  "totalBytes" to totBytes,
+                                  "localPath" to localPath,
+                                  "speedLabel" to speedStr
+                              )
+                          }
+                      }
+                  } catch (_: Throwable) {
+                  }
+                  return null
+              }
+
               override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
                   super.configureFlutterEngine(flutterEngine)
                   MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
@@ -468,6 +569,18 @@ jobs:
                                       cancelSystemDownloadNotification(id)
                                   }
                                   result.success(true)
+                              }
+                              "enqueueSystemDownload" -> {
+                                  val url = call.argument<String>("url") ?: ""
+                                  val title = call.argument<String>("title") ?: "Movie"
+                                  val ua = call.argument<String>("userAgent") ?: ""
+                                  val cookies = call.argument<String>("cookies") ?: ""
+                                  val dlId = enqueueNativeDownload(url, title, ua, cookies)
+                                  result.success(dlId)
+                              }
+                              "pollSystemActiveDownload" -> {
+                                  val info = queryActiveSystemDownload()
+                                  result.success(info)
                               }
                               else -> result.notImplemented()
                           }

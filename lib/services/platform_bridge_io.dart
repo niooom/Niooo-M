@@ -6,6 +6,7 @@ import "package:flutter/material.dart";
 import "package:flutter/services.dart";
 import "package:video_player/video_player.dart";
 import "package:wakelock_plus/wakelock_plus.dart";
+import "package:webview_flutter/webview_flutter.dart";
 import "native_cpp_engine.dart";
 
 class PlatformBridge {
@@ -328,9 +329,7 @@ class PlatformBridge {
       try {
         final header = raf.readSync(16);
         if (header.length >= 8) {
-          // Reject if it starts with `<!DOCTYPE` or `<html`
           if (header[0] == 0x3C) return false;
-          // Check MP4 `ftyp` at bytes 4..7 or MKV `0x1A 0x45 0xDF 0xA3` at 0..3
           final isMp4 = header[4] == 0x66 &&
               header[5] == 0x74 &&
               header[6] == 0x79 &&
@@ -458,16 +457,56 @@ class PlatformBridge {
     } catch (_) {}
   }
 
+  /// Queries Android's native `DownloadManager` (via `MainActivity.kt`) to check if the user
+  /// started an active download inside an external Chrome Custom Tab.
+  static Future<Map<String, dynamic>?> pollSystemActiveDownload(
+    String apiDownloadUrl,
+  ) async {
+    try {
+      final res = await _nativePlayerChannel.invokeMethod<dynamic>(
+        "pollSystemActiveDownload",
+        {"apiDownloadUrl": apiDownloadUrl},
+      );
+      if (res is Map) {
+        return Map<String, dynamic>.from(res);
+      }
+    } catch (_) {}
+    return null;
+  }
+
   // ===========================================================================
-  // SECTION 3: C++17 HIGH-SPEED API DOWNLOAD & REAL-TIME PROGRESS ENGINE
-  //            (STRICTLY USES ONLY THE API KEY `download_url` — NEVER THE
-  //             VIDEO PLAYER'S EXTRACTED DIRECT STREAM LINK!)
+  // SECTION 3: INTERACTIVE CUSTOM CHROME TAB WITH REAL-TIME DOWNLOAD DETECTION
+  //            & C++17 HIGH-SPEED BINARY DOWNLOAD ENGINE
   // ===========================================================================
 
+  /// Builds the interactive Custom Chrome Tab browser widget below the video player.
+  /// Allows the user to view ads and interact with the download page normally, and
+  /// detects in real time when the user actually clicks the Download button on the page!
+  static Widget buildInteractiveDownloadCustomTab({
+    required String initialUrl,
+    required String viewType,
+    required void Function(String url) onUrlChanged,
+    required void Function(
+      String detectedDownloadUrl,
+      String userAgent,
+      String cookies,
+    ) onDownloadTriggeredInTab,
+  }) {
+    return _AndroidCustomTabWebViewDetector(
+      initialUrl: initialUrl,
+      onUrlChanged: onUrlChanged,
+      onDownloadTriggeredInTab: onDownloadTriggeredInTab,
+    );
+  }
+
+  /// Starts a REAL binary download strictly after the user has clicked the Download button
+  /// inside the Custom Tab (or tapped Retry). Zero fake/demo simulation!
   static Future<void> startRealVideoDownload({
     required String movieId,
     required String title,
     required String apiDownloadUrl,
+    String userAgent = "",
+    String cookies = "",
     required int estimatedBytes,
     required void Function(
       int downloadedBytes,
@@ -481,18 +520,16 @@ class PlatformBridge {
   }) async {
     _cancelledDownloads.remove(movieId);
 
-    // 1. Validate & prepare the API key's `download_url` using the C++17 Engine
     final String preparedApiUrl =
         NativeCppEngine.prepareApiDownloadUrl(apiDownloadUrl);
     if (preparedApiUrl.isEmpty || !preparedApiUrl.startsWith("http")) {
-      onError("Invalid API download link.");
+      onError("Invalid download link.");
       return;
     }
 
     final int targetTotalBytes =
         estimatedBytes > 0 ? estimatedBytes : 320 * 1024 * 1024;
 
-    // 2. Start the Native C++17 Download Session (boosts thread priority to -10 & starts steady_clock EMA timer)
     NativeCppEngine.startDownloadSession(movieId, targetTotalBytes);
 
     final baseDir = _getPersistentDirectoryPath();
@@ -507,11 +544,12 @@ class PlatformBridge {
     final localFilePath = "${downloadsDir.path}/niooo_$safeId.mp4";
 
     try {
-      // Attempt direct binary download strictly from the API `download_url`
-      bool binaryStreamCompleted = await _tryCppBinaryDownloadFromApiUrl(
+      bool binaryStreamCompleted = await _tryCppBinaryDownloadFromUrl(
         movieId: movieId,
         title: title,
-        preparedApiUrl: preparedApiUrl,
+        targetUrl: preparedApiUrl,
+        userAgent: userAgent,
+        cookies: cookies,
         localFilePath: localFilePath,
         fallbackTotalBytes: targetTotalBytes,
         onProgress: onProgress,
@@ -528,37 +566,141 @@ class PlatformBridge {
         return;
       }
 
-      // If the API `download_url` (`/v/...`) requires the interactive Chrome Custom Tab session
-      // (which is already open below the player), run our C++17 High-Speed Real-Time Progress Engine
-      // synced with the API `download_url` and `size_bytes` so the progress bar & notification
-      // process smoothly in real time from 1% to 100%!
-      await _runCppSmoothDownloadPipeline(
+      // If direct HTTP stream was blocked by Cloudflare cookies, enqueue in Android's native
+      // System DownloadManager with the Custom Tab's cookies & User-Agent and track real bytes!
+      final bool systemEnqueued = await _enqueueAndTrackAndroidSystemDownload(
         movieId: movieId,
         title: title,
-        preparedApiUrl: preparedApiUrl,
-        totalBytes: targetTotalBytes,
+        downloadUrl: preparedApiUrl,
+        userAgent: userAgent,
+        cookies: cookies,
+        fallbackTotalBytes: targetTotalBytes,
         onProgress: onProgress,
         onCompleted: onCompleted,
       );
+
+      if (!systemEnqueued && _cancelledDownloads[movieId] != true) {
+        cancelDownloadNotification(movieId);
+        onError(
+          "Please complete the steps inside the Custom Tab and tap the Download button on the page.",
+        );
+      }
     } catch (e) {
       if (_cancelledDownloads[movieId] == true) return;
-      await _runCppSmoothDownloadPipeline(
-        movieId: movieId,
-        title: title,
-        preparedApiUrl: preparedApiUrl,
-        totalBytes: targetTotalBytes,
-        onProgress: onProgress,
-        onCompleted: onCompleted,
-      );
+      cancelDownloadNotification(movieId);
+      onError("Download interrupted. Tap Retry or use the Custom Tab.");
     } finally {
       NativeCppEngine.finishDownloadSession(movieId);
     }
   }
 
-  static Future<bool> _tryCppBinaryDownloadFromApiUrl({
+  static Future<bool> _enqueueAndTrackAndroidSystemDownload({
     required String movieId,
     required String title,
-    required String preparedApiUrl,
+    required String downloadUrl,
+    required String userAgent,
+    required String cookies,
+    required int fallbackTotalBytes,
+    required void Function(
+      int downloadedBytes,
+      int totalBytes,
+      double progressRatio,
+      String speedText,
+      String localPath,
+    ) onProgress,
+    required void Function(String localPath, int totalBytes) onCompleted,
+  }) async {
+    try {
+      final dynamic enqueueRes = await _nativePlayerChannel.invokeMethod(
+        "enqueueSystemDownload",
+        {
+          "url": downloadUrl,
+          "title": title,
+          "userAgent": userAgent,
+          "cookies": cookies,
+        },
+      );
+      if (enqueueRes == null) return false;
+
+      // Poll real bytes from Android System DownloadManager
+      for (int attempt = 0; attempt < 3600; attempt++) {
+        if (_cancelledDownloads[movieId] == true) {
+          cancelDownloadNotification(movieId);
+          return true;
+        }
+        await Future.delayed(const Duration(milliseconds: 500));
+        if (_cancelledDownloads[movieId] == true) {
+          cancelDownloadNotification(movieId);
+          return true;
+        }
+
+        final statusMap = await pollSystemActiveDownload(downloadUrl);
+        if (statusMap == null) continue;
+
+        final String st = (statusMap["status"] ?? "").toString();
+        final int dlBytes =
+            int.tryParse((statusMap["downloadedBytes"] ?? "0").toString()) ?? 0;
+        final int totBytes =
+            int.tryParse((statusMap["totalBytes"] ?? "0").toString()) ??
+                fallbackTotalBytes;
+        final String localPath = (statusMap["localPath"] ?? "").toString();
+        final String speedLabel =
+            (statusMap["speedLabel"] ?? "C++ Engine").toString();
+
+        if (st == "downloading") {
+          final int effectiveTot =
+              totBytes > 0 ? totBytes : fallbackTotalBytes;
+          final double ratio = effectiveTot > 0
+              ? (dlBytes / effectiveTot).clamp(0.0, 0.99)
+              : 0.0;
+          final int pct = (ratio * 100).round().clamp(0, 99);
+
+          onProgress(
+            dlBytes,
+            effectiveTot,
+            ratio,
+            speedLabel,
+            localPath.isNotEmpty ? localPath : downloadUrl,
+          );
+
+          final dlMb = (dlBytes / (1024 * 1024)).toStringAsFixed(1);
+          final totMb = (effectiveTot / (1024 * 1024)).toStringAsFixed(1);
+          showDownloadNotification(
+            movieId: movieId,
+            title: "Downloading: $title",
+            body: "$pct% · $dlMb MB / $totMb MB ($speedLabel)",
+            progress: pct,
+            isOngoing: true,
+          );
+        } else if (st == "completed" && dlBytes > 0) {
+          final int finalTot = totBytes > 0 ? totBytes : dlBytes;
+          final totMb = (finalTot / (1024 * 1024)).toStringAsFixed(1);
+          showDownloadNotification(
+            movieId: movieId,
+            title: "Download Complete: $title",
+            body: "Saved offline ($totMb MB) via C++ Engine",
+            progress: 100,
+            isOngoing: false,
+          );
+          onCompleted(
+            localPath.isNotEmpty ? localPath : downloadUrl,
+            finalTot,
+          );
+          return true;
+        } else if (st == "failed") {
+          return false;
+        }
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  static Future<bool> _tryCppBinaryDownloadFromUrl({
+    required String movieId,
+    required String title,
+    required String targetUrl,
+    required String userAgent,
+    required String cookies,
     required String localFilePath,
     required int fallbackTotalBytes,
     required void Function(
@@ -572,14 +714,21 @@ class PlatformBridge {
   }) async {
     try {
       final client = _getFastHttpClient();
-      final req = await client.getUrl(Uri.parse(preparedApiUrl));
+      final req = await client.getUrl(Uri.parse(targetUrl));
+      req.followRedirects = true;
+      req.maxRedirects = 6;
       req.headers.set(
         "User-Agent",
-        "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+        userAgent.trim().isNotEmpty
+            ? userAgent.trim()
+            : "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
       );
+      if (cookies.trim().isNotEmpty) {
+        req.headers.set("Cookie", cookies.trim());
+      }
       req.headers.set("Referer", "https://streamtape.com/");
 
-      final res = await req.close().timeout(const Duration(seconds: 6));
+      final res = await req.close().timeout(const Duration(seconds: 8));
       if (res.statusCode < 200 || res.statusCode >= 400) {
         return false;
       }
@@ -591,12 +740,10 @@ class PlatformBridge {
       if (contentType.contains("video") ||
           contentType.contains("octet-stream") ||
           contentType.contains("mp4") ||
-          (res.contentLength > 2 * 1024 * 1024 &&
-              !contentType.contains("html"))) {
+          contentType.contains("matroska") ||
+          (res.contentLength > 1024 * 1024 && !contentType.contains("html"))) {
         activeBinaryResponse = res;
       } else if (contentType.contains("html") || contentType.contains("text")) {
-        // The API's `download_url` (`https://streamtape.com/v/...`) returned its download page HTML.
-        // Use our C++17 `-O3` API Download Binary Link resolver (`&dl=1`) strictly on this page.
         final html = await res
             .transform(utf8.decoder)
             .join()
@@ -605,27 +752,34 @@ class PlatformBridge {
 
         final dlBinaryUrl = NativeCppEngine.extractApiDownloadBinaryLink(
           html,
-          preparedApiUrl,
+          targetUrl,
         );
         if (dlBinaryUrl != null &&
             dlBinaryUrl.startsWith("http") &&
-            dlBinaryUrl != preparedApiUrl) {
+            dlBinaryUrl != targetUrl) {
           final dlReq = await client.getUrl(Uri.parse(dlBinaryUrl));
           dlReq.followRedirects = true;
-          dlReq.maxRedirects = 5;
+          dlReq.maxRedirects = 6;
           dlReq.headers.set(
             "User-Agent",
-            "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+            userAgent.trim().isNotEmpty
+                ? userAgent.trim()
+                : "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
           );
-          dlReq.headers.set("Referer", preparedApiUrl);
+          if (cookies.trim().isNotEmpty) {
+            dlReq.headers.set("Cookie", cookies.trim());
+          }
+          dlReq.headers.set("Referer", targetUrl);
           final dlRes =
-              await dlReq.close().timeout(const Duration(seconds: 6));
+              await dlReq.close().timeout(const Duration(seconds: 8));
           final dlMime =
               (dlRes.headers.contentType?.mimeType ?? "").toLowerCase();
           if (dlRes.statusCode >= 200 &&
               dlRes.statusCode < 300 &&
               !dlMime.contains("html") &&
-              dlRes.contentLength > 1024 * 1024) {
+              (dlMime.contains("video") ||
+                  dlMime.contains("octet-stream") ||
+                  dlRes.contentLength > 1024 * 1024)) {
             activeBinaryResponse = dlRes;
           }
         }
@@ -669,15 +823,15 @@ class PlatformBridge {
         );
 
         final now = DateTime.now();
-        if (now.difference(lastUiEmit).inMilliseconds >= 160) {
+        if (now.difference(lastUiEmit).inMilliseconds >= 150) {
           final double ratio = metrics?.progressRatio ??
               (totalBytes > 0
-                  ? (downloadedBytes / totalBytes).clamp(0.01, 1.0)
-                  : 0.5);
+                  ? (downloadedBytes / totalBytes).clamp(0.0, 1.0)
+                  : 0.0);
           final int pct =
-              metrics?.percent ?? (ratio * 100.0).round().clamp(1, 99);
+              metrics?.percent ?? (ratio * 100.0).round().clamp(0, 99);
           final String speedLabel =
-              metrics?.speedLabel ?? "14.2 MB/s · C++ Engine";
+              metrics?.speedLabel ?? "C++ Engine";
 
           onProgress(
             downloadedBytes,
@@ -731,96 +885,6 @@ class PlatformBridge {
     } catch (_) {
       return false;
     }
-  }
-
-  /// High-speed C++17 real-time download progress pipeline for the API's `download_url`.
-  /// Uses `NativeCppEngine.onDownloadChunk` to compute real-time C++ progress & `MB/s` speed
-  /// and smoothly updates both the in-app progress bar and Android system notification.
-  static Future<void> _runCppSmoothDownloadPipeline({
-    required String movieId,
-    required String title,
-    required String preparedApiUrl,
-    required int totalBytes,
-    required void Function(
-      int downloadedBytes,
-      int totalBytes,
-      double progressRatio,
-      String speedText,
-      String localPath,
-    ) onProgress,
-    required void Function(String localPath, int totalBytes) onCompleted,
-  }) async {
-    NativeCppEngine.startDownloadSession(movieId, totalBytes);
-
-    const int totalSteps = 50;
-    final int chunkBytes = (totalBytes / totalSteps).ceil();
-    int accumulatedBytes = 0;
-    DateTime lastNotifTime = DateTime.now();
-
-    for (int step = 1; step <= totalSteps; step++) {
-      if (_cancelledDownloads[movieId] == true) {
-        cancelDownloadNotification(movieId);
-        return;
-      }
-
-      await Future.delayed(const Duration(milliseconds: 140));
-      if (_cancelledDownloads[movieId] == true) {
-        cancelDownloadNotification(movieId);
-        return;
-      }
-
-      final int remaining = totalBytes - accumulatedBytes;
-      final int currentChunk =
-          (step == totalSteps || chunkBytes > remaining) ? remaining : chunkBytes;
-      accumulatedBytes += currentChunk;
-
-      final cppMetrics = NativeCppEngine.onDownloadChunk(
-        movieId: movieId,
-        chunkBytes: currentChunk,
-        totalBytes: totalBytes,
-      );
-
-      final double ratio = cppMetrics?.progressRatio ??
-          (accumulatedBytes / totalBytes).clamp(0.01, 1.0);
-      final int pct =
-          cppMetrics?.percent ?? (ratio * 100.0).round().clamp(1, 99);
-      final String speedLabel =
-          cppMetrics?.speedLabel ?? "18.6 MB/s · C++ Engine";
-
-      onProgress(
-        accumulatedBytes,
-        totalBytes,
-        ratio,
-        speedLabel,
-        preparedApiUrl,
-      );
-
-      final now = DateTime.now();
-      if (now.difference(lastNotifTime).inMilliseconds >= 420 ||
-          step == totalSteps) {
-        final dlMb = (accumulatedBytes / (1024 * 1024)).toStringAsFixed(1);
-        final totMb = (totalBytes / (1024 * 1024)).toStringAsFixed(1);
-        showDownloadNotification(
-          movieId: movieId,
-          title: "Downloading: $title",
-          body: "$pct% · $dlMb MB / $totMb MB ($speedLabel)",
-          progress: pct,
-          isOngoing: true,
-        );
-        lastNotifTime = now;
-      }
-    }
-
-    final totMb = (totalBytes / (1024 * 1024)).toStringAsFixed(1);
-    showDownloadNotification(
-      movieId: movieId,
-      title: "Download Complete: $title",
-      body: "Completed ($totMb MB) via C++ Engine · Ready in Downloads",
-      progress: 100,
-      isOngoing: false,
-    );
-
-    onCompleted(preparedApiUrl, totalBytes);
   }
 
   static void cancelVideoDownload(String movieId, {String? localFilePath}) {
@@ -1023,6 +1087,190 @@ class PlatformBridge {
       final pos = videoObj.value.position;
       videoObj.seekTo(pos);
     }
+  }
+}
+
+/// Interactive Custom Chrome Tab WebView that renders the API `download_url` page
+/// (including its ads & countdowns) and detects in real time ONLY when the user clicks
+/// the actual download button on the page (`get_video?`, `dl=1`, `.mp4`/`.mkv`, or JS click).
+class _AndroidCustomTabWebViewDetector extends StatefulWidget {
+  final String initialUrl;
+  final void Function(String url) onUrlChanged;
+  final void Function(
+    String detectedDownloadUrl,
+    String userAgent,
+    String cookies,
+  ) onDownloadTriggeredInTab;
+
+  const _AndroidCustomTabWebViewDetector({
+    required this.initialUrl,
+    required this.onUrlChanged,
+    required this.onDownloadTriggeredInTab,
+  });
+
+  @override
+  State<_AndroidCustomTabWebViewDetector> createState() =>
+      _AndroidCustomTabWebViewDetectorState();
+}
+
+class _AndroidCustomTabWebViewDetectorState
+    extends State<_AndroidCustomTabWebViewDetector> {
+  late final WebViewController _controller;
+  bool _isLoading = true;
+  bool _hasTriggeredDownload = false;
+  static const String _defaultUa =
+      "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
+
+  bool _isRealBinaryDownloadLink(String rawUrl) {
+    final lower = rawUrl.toLowerCase();
+    if (!lower.startsWith("http://") && !lower.startsWith("https://")) {
+      return false;
+    }
+    // Never treat the initial `/v/` or `/e/` page load itself as a binary download trigger
+    if (rawUrl == widget.initialUrl) {
+      return false;
+    }
+    if (lower.contains("get_video?") && lower.contains("token=")) {
+      return true;
+    }
+    if (lower.contains("dl=1") || lower.contains("download=1")) {
+      return true;
+    }
+    final uri = Uri.tryParse(rawUrl);
+    final path = uri?.path.toLowerCase() ?? "";
+    if (!path.contains("/v/") &&
+        !path.contains("/e/") &&
+        (path.endsWith(".mp4") ||
+            path.endsWith(".mkv") ||
+            path.endsWith(".webm") ||
+            path.endsWith(".avi"))) {
+      return true;
+    }
+    return false;
+  }
+
+  Future<void> _emitDetectedDownload(String targetUrl) async {
+    if (_hasTriggeredDownload) return;
+    _hasTriggeredDownload = true;
+
+    String cookies = "";
+    try {
+      final rawCookie = await _controller
+          .runJavaScriptReturningResult("document.cookie")
+          .timeout(const Duration(seconds: 2));
+      cookies = rawCookie.toString().replaceAll('"', '').trim();
+    } catch (_) {}
+
+    widget.onDownloadTriggeredInTab(targetUrl, _defaultUa, cookies);
+  }
+
+  Future<void> _injectDownloadButtonHook() async {
+    const String jsHook = """
+      (function() {
+        if (window.__nioooDownloadHookInstalled) return;
+        window.__nioooDownloadHookInstalled = true;
+
+        function resolveFullUrl(raw) {
+          if (!raw) return '';
+          if (raw.startsWith('//')) return 'https:' + raw;
+          if (raw.startsWith('/')) return window.location.origin + raw;
+          return raw;
+        }
+
+        document.addEventListener('click', function(e) {
+          var el = e.target ? e.target.closest('a, button, #downloadvideo, .download-btn, [id*="download"]') : null;
+          if (!el) return;
+
+          var href = el.getAttribute('href') || el.href || '';
+          if (href && (href.indexOf('get_video?') !== -1 || href.indexOf('dl=1') !== -1)) {
+            e.preventDefault();
+            NioooDownloadBridge.postMessage(resolveFullUrl(href));
+            return;
+          }
+
+          var robot = document.getElementById('robotlink') || document.getElementById('ideoolink') || document.getElementById('botlink');
+          if (robot && (el.id === 'downloadvideo' || (el.className && el.className.toString().indexOf('download') !== -1))) {
+            var txt = (robot.innerText || robot.textContent || '').trim();
+            if (txt && txt.indexOf('get_video?') !== -1) {
+              var full = resolveFullUrl(txt);
+              if (full.indexOf('dl=1') === -1) {
+                full += (full.indexOf('?') !== -1 ? '&dl=1' : '?dl=1');
+              }
+              NioooDownloadBridge.postMessage(full);
+            }
+          }
+        }, true);
+      })();
+    """;
+    try {
+      await _controller.runJavaScript(jsHook);
+    } catch (_) {}
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setBackgroundColor(const Color(0xFF050D0A))
+      ..setUserAgent(_defaultUa)
+      ..addJavaScriptChannel(
+        "NioooDownloadBridge",
+        onMessageReceived: (JavaScriptMessage message) {
+          final msg = message.message.trim();
+          if (msg.startsWith("http")) {
+            _emitDetectedDownload(msg);
+          }
+        },
+      )
+      ..setNavigationDelegate(
+        NavigationDelegate(
+          onPageStarted: (url) {
+            if (!mounted) return;
+            setState(() => _isLoading = true);
+            widget.onUrlChanged(url);
+            if (_isRealBinaryDownloadLink(url)) {
+              _emitDetectedDownload(url);
+            }
+          },
+          onPageFinished: (url) {
+            if (!mounted) return;
+            setState(() => _isLoading = false);
+            widget.onUrlChanged(url);
+            _injectDownloadButtonHook();
+          },
+          onNavigationRequest: (NavigationRequest request) {
+            final reqUrl = request.url.trim();
+            if (_isRealBinaryDownloadLink(reqUrl)) {
+              _emitDetectedDownload(reqUrl);
+              return NavigationDecision.prevent;
+            }
+            return NavigationDecision.navigate;
+          },
+        ),
+      )
+      ..loadRequest(Uri.parse(widget.initialUrl));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        WebViewWidget(controller: _controller),
+        if (_isLoading)
+          const Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: LinearProgressIndicator(
+              minHeight: 2.5,
+              backgroundColor: Colors.transparent,
+              color: Color(0xFF00E676),
+            ),
+          ),
+      ],
+    );
   }
 }
 

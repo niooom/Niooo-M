@@ -802,10 +802,16 @@ class _ProfileSettingsPageState extends State<ProfileSettingsPage> {
                   if (task.apiDownloadUrl.isNotEmpty)
                     GestureDetector(
                       onTap: () {
-                        MiniChromeBrowserService.openAdUrlBelowPlayer(
+                        MiniChromeBrowserService.openDownloadPortalBelowPlayer(
                           context,
-                          task.apiDownloadUrl,
-                          title: "Download · ${task.title}",
+                          movieId: task.movieId,
+                          title: task.title,
+                          posterUrl: task.posterUrl,
+                          backdropUrl: task.backdropUrl,
+                          qualityBadge: task.qualityBadge,
+                          language: task.language,
+                          apiDownloadUrl: task.apiDownloadUrl,
+                          estimatedSizeBytes: task.totalBytes,
                         );
                       },
                       child: Container(
