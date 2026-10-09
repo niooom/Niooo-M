@@ -1,5 +1,10 @@
 package com.niooo.m.flutter_live_app
 
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.os.Build
 import android.os.Bundle
@@ -7,12 +12,14 @@ import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
+import androidx.core.app.NotificationCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
     private val CHANNEL = "com.niooo.m/player"
+    private val DOWNLOAD_CHANNEL_ID = "niooo_m_downloads_channel"
 
     companion object {
         init {
@@ -31,6 +38,7 @@ class MainActivity : FlutterActivity() {
             initNativeCppEngine()
         } catch (_: Throwable) {
         }
+        createDownloadNotificationChannel()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.setFlags(
             WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
@@ -45,6 +53,75 @@ class MainActivity : FlutterActivity() {
                 window.attributes.preferredDisplayModeId = 0
             } catch (_: Throwable) {
             }
+        }
+    }
+
+    private fun createDownloadNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val channel = NotificationChannel(
+                DOWNLOAD_CHANNEL_ID,
+                "Niooo M Offline Downloads",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Real-time movie download progress and offline completion notifications"
+                setShowBadge(true)
+            }
+            manager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun showSystemDownloadNotification(
+        notificationId: Int,
+        title: String,
+        body: String,
+        progress: Int,
+        isOngoing: Boolean
+    ) {
+        try {
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val intent = Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            }
+            val pendingFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            } else {
+                PendingIntent.FLAG_UPDATE_CURRENT
+            }
+            val pendingIntent = PendingIntent.getActivity(this, notificationId, intent, pendingFlags)
+
+            val iconRes = if (isOngoing) {
+                android.R.drawable.stat_sys_download
+            } else {
+                android.R.drawable.stat_sys_download_done
+            }
+
+            val builder = NotificationCompat.Builder(this, DOWNLOAD_CHANNEL_ID)
+                .setSmallIcon(iconRes)
+                .setContentTitle(title)
+                .setContentText(body)
+                .setContentIntent(pendingIntent)
+                .setOnlyAlertOnce(true)
+                .setOngoing(isOngoing)
+                .setAutoCancel(!isOngoing)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+
+            if (isOngoing) {
+                builder.setProgress(100, progress.coerceIn(0, 100), false)
+            } else {
+                builder.setProgress(0, 0, false)
+            }
+
+            manager.notify(notificationId, builder.build())
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun cancelSystemDownloadNotification(notificationId: Int) {
+        try {
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.cancel(notificationId)
+        } catch (_: Throwable) {
         }
     }
 
@@ -88,6 +165,24 @@ class MainActivity : FlutterActivity() {
                         } catch (_: Throwable) {
                             result.success("Fallback Mode")
                         }
+                    }
+                    "showDownloadNotification" -> {
+                        val id = call.argument<Int>("id") ?: 1001
+                        val title = call.argument<String>("title") ?: "Niooo M Download"
+                        val body = call.argument<String>("body") ?: "Downloading..."
+                        val progress = call.argument<Int>("progress") ?: 0
+                        val ongoing = call.argument<Boolean>("ongoing") ?: true
+                        runOnUiThread {
+                            showSystemDownloadNotification(id, title, body, progress, ongoing)
+                        }
+                        result.success(true)
+                    }
+                    "cancelDownloadNotification" -> {
+                        val id = call.argument<Int>("id") ?: 1001
+                        runOnUiThread {
+                            cancelSystemDownloadNotification(id)
+                        }
+                        result.success(true)
                     }
                     else -> result.notImplemented()
                 }

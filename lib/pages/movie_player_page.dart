@@ -4,6 +4,7 @@ import "package:flutter/material.dart";
 import "../models/movie_models.dart";
 import "../services/mini_chrome_browser_service.dart";
 import "../services/platform_bridge.dart";
+import "../services/watch_history_download_service.dart";
 import "../widgets/glass_container.dart";
 
 class MoviePlayerPage extends StatefulWidget {
@@ -19,6 +20,7 @@ class MoviePlayerPage extends StatefulWidget {
   final ValueChanged<MovieItem> onSelectOtherMovie;
   final ValueChanged<double> onUpdateProgress;
   final ValueChanged<bool>? onFullscreenChanged;
+  final VoidCallback? onOpenDownloadsManager;
 
   const MoviePlayerPage({
     super.key,
@@ -34,6 +36,7 @@ class MoviePlayerPage extends StatefulWidget {
     required this.onSelectOtherMovie,
     required this.onUpdateProgress,
     this.onFullscreenChanged,
+    this.onOpenDownloadsManager,
   });
 
   @override
@@ -56,8 +59,11 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
   bool _isPlaying = true;
   bool _isMuted = false;
   bool _showControls = true;
+  bool _isPlayingOfflineCopy = false;
   double _currentSeconds = 0.0;
   double _totalSeconds = 100.0;
+  double _initialResumeSeconds = 0.0;
+  bool _showResumeToast = false;
   Timer? _hideControlsTimer;
   Timer? _progressPollTimer;
 
@@ -74,7 +80,14 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
     super.initState();
     // Keep screen awake while the video player page is open so the screen never dims or sleeps
     PlatformBridge.setScreenWakelock(true);
+    WatchHistoryDownloadService.instance.addListener(_onDownloadOrHistoryChanged);
     _initStreamtapePlayer(widget.movie);
+  }
+
+  void _onDownloadOrHistoryChanged() {
+    if (mounted) {
+      setState(() {});
+    }
   }
 
   @override
@@ -139,14 +152,24 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
     _availableAudioTracks = _detectMovieAudioTracks(movie);
     _selectedAudioTrackIndex = 0;
 
+    // Look up exact saved timestamp from WatchHistoryDownloadService
+    final savedSec =
+        WatchHistoryDownloadService.instance.getSavedPositionSeconds(movie.id);
+    _initialResumeSeconds = savedSec;
+
     // Automatic Environment Detection:
     // Website -> Streamtape Frame mode (`true`)
     // Android App -> Direct Link mode (`false`)
     _useEmbedFrame = forceEmbedMode ?? PlatformBridge.isWeb;
     _hasStreamError = false;
     _directVideoViewType = null;
-    _currentSeconds = 0.0;
-    _totalSeconds = 100.0;
+    _isPlayingOfflineCopy = false;
+    _currentSeconds = savedSec;
+    final savedHistory =
+        WatchHistoryDownloadService.instance.getHistoryForMovie(movie.id);
+    _totalSeconds = (savedHistory != null && savedHistory.durationSeconds > 0)
+        ? savedHistory.durationSeconds
+        : 100.0;
 
     final String embedSrc = movie.embedUrl.isNotEmpty
         ? movie.embedUrl
@@ -165,7 +188,35 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
       return;
     }
 
-    // Running in Direct Link mode (Default for Android App, or if manually clicked)
+    // 1. Check if movie is already downloaded offline on Android device!
+    final offlinePath = WatchHistoryDownloadService.instance
+        .getCompletedOfflineFilePath(movie.id);
+    if (!PlatformBridge.isWeb &&
+        offlinePath != null &&
+        offlinePath.isNotEmpty) {
+      _isPlayingOfflineCopy = true;
+      _setupDirectHtml5Video(
+        movie,
+        offlinePath,
+        initialSeekSeconds: _initialResumeSeconds,
+      );
+      setState(() {
+        _isResolvingDirect = false;
+        _hasStreamError = false;
+        if (_initialResumeSeconds > 3.0) {
+          _showResumeToast = true;
+        }
+      });
+      _switchToDirectPlayer();
+      if (_initialResumeSeconds > 3.0) {
+        Future.delayed(const Duration(seconds: 4), () {
+          if (mounted) setState(() => _showResumeToast = false);
+        });
+      }
+      return;
+    }
+
+    // 2. Running in Direct Link mode (Default for Android App, or if manually clicked)
     setState(() {
       _isResolvingDirect = true;
       _hasStreamError = false;
@@ -182,12 +233,24 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
       if (directUrl != null &&
           directUrl.startsWith("http") &&
           !directUrl.contains("/e/")) {
-        _setupDirectHtml5Video(movie, directUrl);
+        _setupDirectHtml5Video(
+          movie,
+          directUrl,
+          initialSeekSeconds: _initialResumeSeconds,
+        );
         setState(() {
           _isResolvingDirect = false;
           _hasStreamError = false;
+          if (_initialResumeSeconds > 3.0) {
+            _showResumeToast = true;
+          }
         });
         _switchToDirectPlayer();
+        if (_initialResumeSeconds > 3.0) {
+          Future.delayed(const Duration(seconds: 4), () {
+            if (mounted) setState(() => _showResumeToast = false);
+          });
+        }
 
         // Silently pre-extract next episode / recommended movie in background with C++ engine
         final candidates = widget.allMovies
@@ -253,6 +316,41 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
   void _switchToDirectStreamMode() {
     _disposeVideo(keepFullscreenAndWakelock: true);
     _initStreamtapePlayer(widget.movie, forceEmbedMode: false);
+  }
+
+  /// Triggered when the user taps the Download button:
+  /// 1. Opens the movie's download link inside the integrated Custom Chrome Tab (`MiniChromeBrowserService`) right below the video player.
+  /// 2. Starts real-time background download in `WatchHistoryDownloadService` with Android Notification progress + in-app Download Manager tracking.
+  void _handleDownloadMovieTap() {
+    final movie = widget.movie;
+    final String downloadPageLink = movie.downloadUrl.isNotEmpty
+        ? movie.downloadUrl
+        : (movie.streamtapeId.isNotEmpty
+            ? "https://streamtape.com/v/${movie.streamtapeId}/"
+            : (movie.embedUrl.isNotEmpty
+                ? movie.embedUrl.replaceAll("/e/", "/v/")
+                : "https://streamtape.com/v/${movie.id}/"));
+
+    // 1. Start Niooo M Built-in Download Manager & Android Notification Progress
+    WatchHistoryDownloadService.instance.startMovieDownload(
+      movieId: movie.id,
+      title: movie.title,
+      posterUrl: movie.posterUrl,
+      backdropUrl: movie.backdropUrl,
+      qualityBadge: movie.qualityBadge,
+      language: movie.language,
+      streamtapeId: movie.streamtapeId,
+      embedUrl: movie.embedUrl,
+      downloadUrl: downloadPageLink,
+      estimatedSizeBytes: movie.sizeBytes,
+    );
+
+    // 2. Open the download link inside our integrated Custom Chrome Tab below the video player
+    MiniChromeBrowserService.openAdUrlBelowPlayer(
+      context,
+      downloadPageLink,
+      title: "Download · ${movie.title}",
+    );
   }
 
   void _openDualAudioSettingsSheet() {
@@ -498,7 +596,11 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
     );
   }
 
-  void _setupDirectHtml5Video(MovieItem movie, String directMp4Url) {
+  void _setupDirectHtml5Video(
+    MovieItem movie,
+    String directMp4Url, {
+    double initialSeekSeconds = 0.0,
+  }) {
     final viewType =
         "niooo-st-direct-${movie.id}-${DateTime.now().microsecondsSinceEpoch}";
 
@@ -506,6 +608,7 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
       viewType: viewType,
       src: directMp4Url,
       posterUrl: movie.backdropUrl,
+      initialSeekSeconds: initialSeekSeconds,
       onDurationLoaded: (dur) {
         if (!mounted) return;
         setState(() {
@@ -519,6 +622,7 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
       onPause: () {
         if (!mounted) return;
         setState(() => _isPlaying = false);
+        _commitCurrentWatchPosition(force: true);
       },
     );
 
@@ -528,6 +632,26 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
         _directVideoViewType = viewType;
       });
     }
+  }
+
+  void _commitCurrentWatchPosition({bool force = false}) {
+    if (_currentSeconds <= 1.0) return;
+    final movie = widget.movie;
+    final ratio = _totalSeconds > 0
+        ? (_currentSeconds / _totalSeconds).clamp(0.0, 1.0)
+        : 0.0;
+    widget.onUpdateProgress(ratio);
+    WatchHistoryDownloadService.instance.recordWatchPosition(
+      movieId: movie.id,
+      title: movie.title,
+      posterUrl: movie.posterUrl,
+      backdropUrl: movie.backdropUrl,
+      qualityBadge: movie.qualityBadge,
+      language: movie.language,
+      positionSeconds: _currentSeconds,
+      durationSeconds: _totalSeconds,
+      forceCommit: force,
+    );
   }
 
   void _switchToDirectPlayer() {
@@ -542,17 +666,18 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
 
     _progressPollTimer?.cancel();
     _progressPollTimer =
-        Timer.periodic(const Duration(milliseconds: 400), (_) {
+        Timer.periodic(const Duration(milliseconds: 500), (_) {
       if (!mounted || _videoElement == null) return;
       final cur = PlatformBridge.getVideoCurrentTime(_videoElement);
       final dur = PlatformBridge.getVideoDuration(_videoElement);
-      if (!cur.isNaN) {
+      if (!cur.isNaN && cur > 0) {
         setState(() {
           _currentSeconds = cur;
           if (!dur.isNaN && !dur.isInfinite && dur > 0) {
             _totalSeconds = dur;
           }
         });
+        _commitCurrentWatchPosition(force: false);
       }
     });
 
@@ -585,6 +710,7 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
     } else {
       PlatformBridge.pauseVideo(v);
       setState(() => _isPlaying = false);
+      _commitCurrentWatchPosition(force: true);
     }
   }
 
@@ -594,6 +720,7 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
     final target = (_currentSeconds + deltaSeconds).clamp(0.0, _totalSeconds);
     PlatformBridge.setVideoCurrentTime(v, target);
     setState(() => _currentSeconds = target);
+    _commitCurrentWatchPosition(force: true);
     _scheduleHideControls();
   }
 
@@ -636,15 +763,15 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
       PlatformBridge.exitNativeFullscreen();
       return;
     }
+    _commitCurrentWatchPosition(force: true);
     widget.onBack();
   }
 
   void _disposeVideo({bool keepFullscreenAndWakelock = false}) {
     _hideControlsTimer?.cancel();
     _progressPollTimer?.cancel();
-    if (_videoElement != null && _totalSeconds > 0) {
-      final ratio = (_currentSeconds / _totalSeconds).clamp(0.0, 1.0);
-      widget.onUpdateProgress(ratio);
+    if (_videoElement != null && _totalSeconds > 0 && _currentSeconds > 1.0) {
+      _commitCurrentWatchPosition(force: true);
     }
     if (keepFullscreenAndWakelock) {
       if (_videoElement != null) {
@@ -661,6 +788,8 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
 
   @override
   void dispose() {
+    WatchHistoryDownloadService.instance
+        .removeListener(_onDownloadOrHistoryChanged);
     _disposeVideo(keepFullscreenAndWakelock: false);
     _commentController.dispose();
     super.dispose();
@@ -669,8 +798,12 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
   String _formatTime(double seconds) {
     if (seconds.isNaN || seconds.isInfinite || seconds < 0) return "00:00";
     final int total = seconds.round();
-    final int mins = total ~/ 60;
+    final int hrs = total ~/ 3600;
+    final int mins = (total % 3600) ~/ 60;
     final int secs = total % 60;
+    if (hrs > 0) {
+      return "${hrs.toString().padLeft(2, '0')}:${mins.toString().padLeft(2, '0')}:${secs.toString().padLeft(2, '0')}";
+    }
     return "${mins.toString().padLeft(2, '0')}:${secs.toString().padLeft(2, '0')}";
   }
 
@@ -717,7 +850,7 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
               title: movie.title,
             )
           else if (_directVideoViewType != null && _videoElement != null)
-            // Android Environment (or Direct Stream active): Play via Direct Stream
+            // Android Environment (or Direct Stream active): Play via Direct Stream / Offline File
             Stack(
               fit: StackFit.expand,
               children: [
@@ -839,6 +972,8 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
                                               _videoElement, target);
                                           setState(
                                               () => _currentSeconds = target);
+                                          _commitCurrentWatchPosition(
+                                              force: true);
                                           _scheduleHideControls();
                                         },
                                       ),
@@ -931,6 +1066,86 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
               ],
             ),
 
+          // Resume from exact timestamp toast badge
+          if (_showResumeToast && _initialResumeSeconds > 3.0)
+            Positioned(
+              top: 12,
+              left: 56,
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF04140F).withValues(alpha: 0.90),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(
+                    color: const Color(0xFF00E676).withValues(alpha: 0.65),
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: const Color(0xFF00E676).withValues(alpha: 0.25),
+                      blurRadius: 12,
+                    ),
+                  ],
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(
+                      Icons.history_rounded,
+                      color: Color(0xFF00E676),
+                      size: 15,
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      "Resumed from ${_formatTime(_initialResumeSeconds)}",
+                      style: const TextStyle(
+                        color: Color(0xFFF0FDF4),
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+          // Offline Playback Badge
+          if (_isPlayingOfflineCopy && !_showResumeToast)
+            Positioned(
+              top: 12,
+              left: 56,
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF04140F).withValues(alpha: 0.88),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: const Color(0xFF00E676).withValues(alpha: 0.55),
+                  ),
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.offline_pin_rounded,
+                      color: Color(0xFF00E676),
+                      size: 14,
+                    ),
+                    SizedBox(width: 5),
+                    Text(
+                      "Playing Offline Copy",
+                      style: TextStyle(
+                        color: Color(0xFF00E676),
+                        fontSize: 11,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
           // Top-Left: Clean Minimize / Back button
           Positioned(
             top: 10,
@@ -961,34 +1176,65 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
             ),
           ),
 
-          // Top-Right: Clean Settings Icon Only (Single Full Screen button is in the Mode Bar below)
+          // Top-Right: Clean Settings Icon + Quick Download Icon
           Positioned(
             top: 10,
             right: 12,
-            child: GestureDetector(
-              onTap: _openDualAudioSettingsSheet,
-              child: ClipOval(
-                child: BackdropFilter(
-                  filter: ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12),
-                  child: Container(
-                    width: 36,
-                    height: 36,
-                    decoration: BoxDecoration(
-                      color: Colors.black.withValues(alpha: 0.62),
-                      shape: BoxShape.circle,
-                      border: Border.all(
-                        color: const Color(0xFF00E676)
-                            .withValues(alpha: 0.45),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                GestureDetector(
+                  onTap: _handleDownloadMovieTap,
+                  child: ClipOval(
+                    child: BackdropFilter(
+                      filter: ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+                      child: Container(
+                        width: 36,
+                        height: 36,
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.62),
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: const Color(0xFF00E676)
+                                .withValues(alpha: 0.45),
+                          ),
+                        ),
+                        child: const Icon(
+                          Icons.download_rounded,
+                          color: Color(0xFF00E676),
+                          size: 20,
+                        ),
                       ),
-                    ),
-                    child: const Icon(
-                      Icons.settings_rounded,
-                      color: Colors.white,
-                      size: 20,
                     ),
                   ),
                 ),
-              ),
+                const SizedBox(width: 8),
+                GestureDetector(
+                  onTap: _openDualAudioSettingsSheet,
+                  child: ClipOval(
+                    child: BackdropFilter(
+                      filter: ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+                      child: Container(
+                        width: 36,
+                        height: 36,
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.62),
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: const Color(0xFF00E676)
+                                .withValues(alpha: 0.45),
+                          ),
+                        ),
+                        child: const Icon(
+                          Icons.settings_rounded,
+                          color: Colors.white,
+                          size: 20,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
             ),
           ),
         ],
@@ -1003,6 +1249,9 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
     final mediaOrientation = MediaQuery.of(context).orientation;
     final bool isEffectiveFullscreen = _isFullscreen ||
         (!PlatformBridge.isWeb && mediaOrientation == Orientation.landscape);
+
+    final activeDownloadTask =
+        WatchHistoryDownloadService.instance.getDownloadTask(movie.id);
 
     // Group same-series episodes if this movie is part of a multi-episode series
     final sameSeriesEpisodes = movie.isEpisode
@@ -1032,9 +1281,6 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
         ? movie.embedUrl
         : "https://streamtape.com/e/${movie.id}";
 
-    // In Fullscreen mode on Android (or Landscape), expand the video player to fill 100% of the screen.
-    // If the device is still in portrait (e.g. Auto-Rotate is locked by OS), RotatedBox(quarterTurns: 1)
-    // automatically rotates the video player into true landscape fullscreen!
     if (isEffectiveFullscreen) {
       final bool needsManualLandscapeRotation =
           !PlatformBridge.isWeb && mediaSize.height > mediaSize.width;
@@ -1079,7 +1325,7 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
           ),
 
           // ==============================================================
-          // 1B. STREAM MODE & DIRECT OPTIONS BUTTON BAR (AUTO ENVIRONMENT + FRAME/DIRECT BUTTONS)
+          // 1B. STREAM MODE, DOWNLOAD & FULLSCREEN BUTTON BAR
           // ==============================================================
           Container(
             width: double.infinity,
@@ -1096,7 +1342,7 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
               scrollDirection: Axis.horizontal,
               child: Row(
                 children: [
-                  // Streamtape Frame Button (Default & Recommended on Website)
+                  // Streamtape Frame Button
                   GestureDetector(
                     onTap: _switchToStreamtapeFrameMode,
                     child: Container(
@@ -1202,6 +1448,71 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
                   ),
                   const SizedBox(width: 8),
 
+                  // Download Button (Opens Custom Chrome Tab + Starts Real-time Download Manager)
+                  GestureDetector(
+                    onTap: _handleDownloadMovieTap,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 11,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        gradient: (activeDownloadTask != null &&
+                                (activeDownloadTask.isDownloading ||
+                                    activeDownloadTask.isCompleted))
+                            ? const LinearGradient(
+                                colors: [Color(0xFF00E676), Color(0xFF10B981)],
+                              )
+                            : null,
+                        color: (activeDownloadTask != null &&
+                                (activeDownloadTask.isDownloading ||
+                                    activeDownloadTask.isCompleted))
+                            ? null
+                            : Colors.white.withValues(alpha: 0.06),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: const Color(0xFF00E676).withValues(alpha: 0.35),
+                        ),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            activeDownloadTask?.isCompleted == true
+                                ? Icons.offline_pin_rounded
+                                : Icons.download_for_offline_rounded,
+                            size: 15,
+                            color: (activeDownloadTask != null &&
+                                    (activeDownloadTask.isDownloading ||
+                                        activeDownloadTask.isCompleted))
+                                ? const Color(0xFF03120D)
+                                : const Color(0xFF00E676),
+                          ),
+                          const SizedBox(width: 5),
+                          Text(
+                            activeDownloadTask == null
+                                ? "Download Offline"
+                                : activeDownloadTask.isCompleted
+                                    ? "Downloaded (Offline)"
+                                    : activeDownloadTask.isDownloading
+                                        ? "Downloading ${(activeDownloadTask.progress * 100).round()}%"
+                                        : "Retry Download",
+                            style: TextStyle(
+                              color: (activeDownloadTask != null &&
+                                      (activeDownloadTask.isDownloading ||
+                                          activeDownloadTask.isCompleted))
+                                  ? const Color(0xFF03120D)
+                                  : const Color(0xFFF0FDF4),
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+
                   // Dual Audio Quick Button
                   GestureDetector(
                     onTap: _openDualAudioSettingsSheet,
@@ -1284,7 +1595,7 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
           ),
 
           // ==============================================================
-          // 2. BELOW VIDEO PLAYER: TITLE, LIKE / COMMENT / SHARE BAR, EPISODES & OTHER MOVIES
+          // 2. BELOW VIDEO PLAYER: TITLE, LIKE / DOWNLOAD / COMMENT / SHARE BAR, EPISODES & OTHER MOVIES
           // ==============================================================
           Expanded(
             child: ListView(
@@ -1343,7 +1654,7 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
                 const SizedBox(height: 14),
 
                 // ==========================================================
-                // INTERACTIVE LIKE, COMMENT, SHARE & WATCHLIST ACTION BAR
+                // INTERACTIVE LIKE, DOWNLOAD, COMMENT, SHARE & WATCHLIST ACTION BAR
                 // ==========================================================
                 SingleChildScrollView(
                   scrollDirection: Axis.horizontal,
@@ -1361,7 +1672,26 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
                       ),
                       const SizedBox(width: 10),
 
-                      // 2. COMMENT BUTTON
+                      // 2. DOWNLOAD BUTTON (Opens Custom Chrome Tab + Starts Niooo M Download Manager)
+                      _buildActionPill(
+                        icon: activeDownloadTask?.isCompleted == true
+                            ? Icons.offline_pin_rounded
+                            : Icons.download_rounded,
+                        label: activeDownloadTask == null
+                            ? "Download"
+                            : activeDownloadTask.isCompleted
+                                ? "Downloaded"
+                                : activeDownloadTask.isDownloading
+                                    ? "${(activeDownloadTask.progress * 100).round()}% · ${activeDownloadTask.speedLabel}"
+                                    : "Download",
+                        isActive: activeDownloadTask != null &&
+                            (activeDownloadTask.isDownloading ||
+                                activeDownloadTask.isCompleted),
+                        onTap: _handleDownloadMovieTap,
+                      ),
+                      const SizedBox(width: 10),
+
+                      // 3. COMMENT BUTTON
                       _buildActionPill(
                         icon: Icons.mode_comment_outlined,
                         label: "Comment (${movie.comments.length})",
@@ -1372,7 +1702,7 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
                       ),
                       const SizedBox(width: 10),
 
-                      // 3. SHARE BUTTON
+                      // 4. SHARE BUTTON
                       _buildActionPill(
                         icon: Icons.reply_rounded,
                         label:
@@ -1382,7 +1712,7 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
                       ),
                       const SizedBox(width: 10),
 
-                      // 4. SAVE TO WATCHLIST BUTTON
+                      // 5. SAVE TO WATCHLIST BUTTON
                       _buildActionPill(
                         icon: widget.isBookmarked
                             ? Icons.bookmark_added_rounded
@@ -1394,6 +1724,109 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
                     ],
                   ),
                 ),
+
+                // Real-time Download Progress Card inside Player Page when downloading or completed
+                if (activeDownloadTask != null) ...[
+                  const SizedBox(height: 12),
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        colors: [
+                          const Color(0xFF00E676).withValues(alpha: 0.14),
+                          const Color(0xFF061511).withValues(alpha: 0.92),
+                        ],
+                      ),
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(
+                        color: const Color(0xFF00E676).withValues(alpha: 0.4),
+                      ),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Icon(
+                              activeDownloadTask.isCompleted
+                                  ? Icons.check_circle_rounded
+                                  : Icons.downloading_rounded,
+                              color: const Color(0xFF00E676),
+                              size: 18,
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                activeDownloadTask.isCompleted
+                                    ? "Offline Download Complete (${activeDownloadTask.formattedSizeProgress})"
+                                    : "Niooo M Download Manager · ${(activeDownloadTask.progress * 100).round()}%",
+                                style: const TextStyle(
+                                  color: Color(0xFFF0FDF4),
+                                  fontSize: 12.5,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                            ),
+                            if (widget.onOpenDownloadsManager != null)
+                              GestureDetector(
+                                onTap: widget.onOpenDownloadsManager,
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 10,
+                                    vertical: 4,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFF00E676),
+                                    borderRadius: BorderRadius.circular(10),
+                                  ),
+                                  child: const Text(
+                                    "View Downloads",
+                                    style: TextStyle(
+                                      color: Color(0xFF03120D),
+                                      fontSize: 10.5,
+                                      fontWeight: FontWeight.w900,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(6),
+                          child: LinearProgressIndicator(
+                            value: activeDownloadTask.progress.clamp(0.02, 1.0),
+                            minHeight: 5,
+                            backgroundColor: Colors.white12,
+                            color: const Color(0xFF00E676),
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text(
+                              activeDownloadTask.formattedSizeProgress,
+                              style: const TextStyle(
+                                color: Color(0xFF94A3B8),
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            Text(
+                              activeDownloadTask.speedLabel,
+                              style: const TextStyle(
+                                color: Color(0xFF00E676),
+                                fontSize: 11,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
 
                 if (_showShareBanner) ...[
                   const SizedBox(height: 10),
@@ -1409,8 +1842,8 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
                         color: const Color(0xFF00E676).withValues(alpha: 0.45),
                       ),
                     ),
-                    child: Row(
-                      children: const [
+                    child: const Row(
+                      children: [
                         Icon(
                           Icons.check_circle_rounded,
                           color: Color(0xFF00E676),
@@ -1433,7 +1866,7 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
                 ],
 
                 // ==========================================================
-                // SERIES EPISODES SELECTOR (IF WATCHING A SERIES LIKE OUR STICKY LOVE / OPERATION SAFED SAGAR)
+                // SERIES EPISODES SELECTOR
                 // ==========================================================
                 if (sameSeriesEpisodes.length > 1) ...[
                   const SizedBox(height: 16),
@@ -1847,21 +2280,21 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
         padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 9.5),
         decoration: BoxDecoration(
           gradient: isActive
-          ? const LinearGradient(
-              colors: [
-                Color(0xFF00E676),
-                Color(0xFF10B981),
-                Color(0xFF047857),
-              ],
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-            )
-          : LinearGradient(
-              colors: [
-                Colors.white.withValues(alpha: 0.08),
-                const Color(0xFF091714).withValues(alpha: 0.82),
-              ],
-            ),
+              ? const LinearGradient(
+                  colors: [
+                    Color(0xFF00E676),
+                    Color(0xFF10B981),
+                    Color(0xFF047857),
+                  ],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                )
+              : LinearGradient(
+                  colors: [
+                    Colors.white.withValues(alpha: 0.08),
+                    const Color(0xFF091714).withValues(alpha: 0.82),
+                  ],
+                ),
           borderRadius: BorderRadius.circular(24),
           border: Border.all(
             color: isActive
@@ -1906,6 +2339,9 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
   }
 
   Widget _buildUpNextMovieCard(MovieItem item) {
+    final historyRec =
+        WatchHistoryDownloadService.instance.getHistoryForMovie(item.id);
+
     return GestureDetector(
       onTap: () => widget.onSelectOtherMovie(item),
       child: Container(
@@ -1979,7 +2415,9 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
                           borderRadius: BorderRadius.circular(6),
                         ),
                         child: Text(
-                          item.duration,
+                          historyRec != null
+                              ? "Resume ${historyRec.formattedPosition}"
+                              : item.duration,
                           style: const TextStyle(
                             color: Colors.white,
                             fontSize: 10,
@@ -1988,6 +2426,18 @@ class _MoviePlayerPageState extends State<MoviePlayerPage> {
                         ),
                       ),
                     ),
+                    if (historyRec != null)
+                      Positioned(
+                        left: 0,
+                        right: 0,
+                        bottom: 0,
+                        child: LinearProgressIndicator(
+                          value: historyRec.progressRatio.clamp(0.05, 1.0),
+                          minHeight: 3,
+                          backgroundColor: Colors.black45,
+                          color: const Color(0xFF00E676),
+                        ),
+                      ),
                   ],
                 ),
               ),
@@ -2159,4 +2609,3 @@ class _PlayerPercentageLoaderState extends State<_PlayerPercentageLoader>
     );
   }
 }
-

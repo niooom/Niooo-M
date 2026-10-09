@@ -10,6 +10,7 @@ import "pages/explore_page.dart";
 import "pages/watchlist_page.dart";
 import "pages/profile_settings_page.dart";
 import "pages/movie_player_page.dart";
+import "services/watch_history_download_service.dart";
 import "widgets/fluid_glass_bottom_bar.dart";
 
 void main() {
@@ -53,17 +54,20 @@ class _NavHistorySnapshot {
   final int navIndex;
   final String? playingMovieId;
   final bool hasDismissedWelcome;
+  final int profileSubTabIndex;
 
   const _NavHistorySnapshot({
     required this.navIndex,
     required this.playingMovieId,
     required this.hasDismissedWelcome,
+    required this.profileSubTabIndex,
   });
 
   bool matches(_NavHistorySnapshot other) {
     return navIndex == other.navIndex &&
         playingMovieId == other.playingMovieId &&
-        hasDismissedWelcome == other.hasDismissedWelcome;
+        hasDismissedWelcome == other.hasDismissedWelcome &&
+        profileSubTabIndex == other.profileSubTabIndex;
   }
 }
 
@@ -85,7 +89,8 @@ class _NioooCinemaMainScreenState extends State<NioooCinemaMainScreen>
       true; // Direct movie platform access without login
   bool _isSyncingCatalog = false;
   bool _isPlayerFullscreen = false;
-  int _activeNavIndex = 0; // 0: Home, 1: Explore, 2: Watchlist, 3: Profile
+  int _activeNavIndex = 0; // 0: Home, 1: Explore, 2: Watchlist, 3: Profile & Downloads
+  int _profileSubTabIndex = 0; // 0: Continue & History, 1: Offline Downloads
   String? _activePlayingMovieId;
   Timer? _catalogAutoSyncTimer;
 
@@ -97,7 +102,10 @@ class _NioooCinemaMainScreenState extends State<NioooCinemaMainScreen>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _movies = MovieCatalogData.loadCachedVerifiedCatalog();
+    WatchHistoryDownloadService.instance.addListener(_onHistoryServiceChanged);
+    _movies = _applyPersistedWatchHistory(
+      MovieCatalogData.loadCachedVerifiedCatalog(),
+    );
     _seriesList = MovieCatalogData.latestSeriesList;
     _syncFromPublicCatalogApi(forceRefresh: true);
 
@@ -108,8 +116,28 @@ class _NioooCinemaMainScreenState extends State<NioooCinemaMainScreen>
     );
   }
 
+  void _onHistoryServiceChanged() {
+    if (!mounted) return;
+    setState(() {
+      _movies = _applyPersistedWatchHistory(_movies);
+    });
+  }
+
+  List<MovieItem> _applyPersistedWatchHistory(List<MovieItem> list) {
+    final service = WatchHistoryDownloadService.instance;
+    return list.map((m) {
+      final hist = service.getHistoryForMovie(m.id);
+      if (hist != null && hist.progressRatio > 0) {
+        return m.copyWith(watchProgress: hist.progressRatio);
+      }
+      return m;
+    }).toList();
+  }
+
   @override
   void dispose() {
+    WatchHistoryDownloadService.instance
+        .removeListener(_onHistoryServiceChanged);
     WidgetsBinding.instance.removeObserver(this);
     _catalogAutoSyncTimer?.cancel();
     super.dispose();
@@ -126,6 +154,7 @@ class _NioooCinemaMainScreenState extends State<NioooCinemaMainScreen>
         navIndex: _activeNavIndex,
         playingMovieId: _activePlayingMovieId,
         hasDismissedWelcome: _hasDismissedWelcome,
+        profileSubTabIndex: _profileSubTabIndex,
       );
 
   void _pushCurrentStateToHistory() {
@@ -144,16 +173,19 @@ class _NioooCinemaMainScreenState extends State<NioooCinemaMainScreen>
     String? playingMovieId,
     bool clearPlayingMovie = false,
     bool? hasDismissedWelcome,
+    int? profileSubTabIndex,
   }) {
     final targetNavIndex = navIndex ?? _activeNavIndex;
     final targetMovieId =
         clearPlayingMovie ? null : (playingMovieId ?? _activePlayingMovieId);
     final targetWelcome = hasDismissedWelcome ?? _hasDismissedWelcome;
+    final targetProfileSub = profileSubTabIndex ?? _profileSubTabIndex;
 
     final nextSnap = _NavHistorySnapshot(
       navIndex: targetNavIndex,
       playingMovieId: targetMovieId,
       hasDismissedWelcome: targetWelcome,
+      profileSubTabIndex: targetProfileSub,
     );
 
     if (_currentSnapshot.matches(nextSnap)) return;
@@ -163,6 +195,7 @@ class _NioooCinemaMainScreenState extends State<NioooCinemaMainScreen>
       _activeNavIndex = targetNavIndex;
       _activePlayingMovieId = targetMovieId;
       _hasDismissedWelcome = targetWelcome;
+      _profileSubTabIndex = targetProfileSub;
     });
   }
 
@@ -175,6 +208,7 @@ class _NioooCinemaMainScreenState extends State<NioooCinemaMainScreen>
           _activeNavIndex = previous.navIndex;
           _activePlayingMovieId = previous.playingMovieId;
           _hasDismissedWelcome = previous.hasDismissedWelcome;
+          _profileSubTabIndex = previous.profileSubTabIndex;
         });
         return true;
       }
@@ -199,8 +233,6 @@ class _NioooCinemaMainScreenState extends State<NioooCinemaMainScreen>
   void _onSystemPopInvokedWithResult(bool didPop, Object? result) {
     if (didPop) return;
 
-    // If a movie is currently playing in fullscreen or landscape on Android,
-    // exit fullscreen and return to portrait mode first before leaving the player!
     if (_activePlayingMovieId != null &&
         (_isPlayerFullscreen ||
             MediaQuery.of(context).orientation == Orientation.landscape)) {
@@ -257,16 +289,19 @@ class _NioooCinemaMainScreenState extends State<NioooCinemaMainScreen>
     if (!mounted) return;
 
     if (snapshot != null && snapshot.allItems.isNotEmpty) {
-      // Preserve watchProgress & comments for any movies already in state
       final Map<String, MovieItem> existingById = {
         for (final m in _movies) m.id: m,
       };
+      final historyService = WatchHistoryDownloadService.instance;
 
       final List<MovieItem> merged = snapshot.allItems.map((item) {
         final prev = existingById[item.id];
+        final hist = historyService.getHistoryForMovie(item.id);
+        final double savedProgress =
+            hist != null ? hist.progressRatio : (prev?.watchProgress ?? item.watchProgress);
         if (prev != null) {
           return item.copyWith(
-            watchProgress: prev.watchProgress,
+            watchProgress: savedProgress,
             likesCount: prev.likesCount,
             sharesCount: prev.sharesCount,
             comments: prev.comments.length > item.comments.length
@@ -274,7 +309,7 @@ class _NioooCinemaMainScreenState extends State<NioooCinemaMainScreen>
                 : item.comments,
           );
         }
-        return item;
+        return item.copyWith(watchProgress: savedProgress);
       }).toList();
 
       setState(() {
@@ -364,6 +399,11 @@ class _NioooCinemaMainScreenState extends State<NioooCinemaMainScreen>
   }
 
   void _openMoviePlayer(MovieItem movie) {
+    if (!_movies.any((m) => m.id == movie.id)) {
+      setState(() {
+        _movies = [movie, ..._movies];
+      });
+    }
     _navigateTo(playingMovieId: movie.id);
   }
 
@@ -468,12 +508,19 @@ class _NioooCinemaMainScreenState extends State<NioooCinemaMainScreen>
                             },
                             onUpdateProgress: (p) =>
                                 _updateMovieProgress(playingMovie.id, p),
+                            onOpenDownloadsManager: () {
+                              _navigateTo(
+                                navIndex: 3,
+                                clearPlayingMovie: true,
+                                profileSubTabIndex: 1,
+                              );
+                            },
                           )
                         : _buildMainTabs(),
               ),
             ),
 
-            // Floating Liquid Glass Bottom Navigation Bar (hidden when Welcome or MoviePlayer is open)
+            // Floating Liquid Glass Bottom Navigation Bar
             if (_hasDismissedWelcome && playingMovie == null)
               Positioned(
                 left: 16,
@@ -483,7 +530,11 @@ class _NioooCinemaMainScreenState extends State<NioooCinemaMainScreen>
                   selectedIndex: _activeNavIndex,
                   unreadChatsCount: _watchlistIds.length,
                   onTabSelected: (idx) {
-                    _navigateTo(navIndex: idx, clearPlayingMovie: true);
+                    _navigateTo(
+                      navIndex: idx,
+                      clearPlayingMovie: true,
+                      profileSubTabIndex: idx == 3 ? 0 : _profileSubTabIndex,
+                    );
                   },
                 ),
               ),
@@ -505,8 +556,11 @@ class _NioooCinemaMainScreenState extends State<NioooCinemaMainScreen>
           onToggleWatchlist: _toggleWatchlist,
           onOpenWatchlistTab: () =>
               _navigateTo(navIndex: 2, clearPlayingMovie: true),
-          onOpenProfileTab: () =>
-              _navigateTo(navIndex: 3, clearPlayingMovie: true),
+          onOpenProfileTab: () => _navigateTo(
+            navIndex: 3,
+            clearPlayingMovie: true,
+            profileSubTabIndex: 0,
+          ),
           onRefreshStreamtape: () =>
               _syncFromPublicCatalogApi(forceRefresh: true),
           isSyncingStreamtape: _isSyncingCatalog,
@@ -531,8 +585,11 @@ class _NioooCinemaMainScreenState extends State<NioooCinemaMainScreen>
         );
       case 3:
       default:
-        return const ProfileSettingsPage(
-          key: ValueKey("tab_profile"),
+        return ProfileSettingsPage(
+          key: ValueKey("tab_profile_$_profileSubTabIndex"),
+          movies: _movies,
+          onPlayMovie: _openMoviePlayer,
+          initialTabIndex: _profileSubTabIndex,
         );
     }
   }

@@ -17,6 +17,7 @@ class PlatformBridge {
   static final Map<String, String> _memoryStorage = {};
   static final Map<String, String> _directUrlCache = {};
   static final Map<String, Future<String?>> _inFlightExtractions = {};
+  static final Map<String, bool> _cancelledDownloads = {};
 
   static HttpClient? _sharedHttpClient;
 
@@ -172,7 +173,10 @@ class PlatformBridge {
     try {
       final client = _getFastHttpClient();
       final req = await client.getUrl(Uri.parse(pageUrl));
-      req.headers.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+      req.headers.set(
+        "Accept",
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      );
       req.headers.set("Referer", "https://streamtape.com/");
       final res = await req.close();
       if (res.statusCode != 200) return null;
@@ -232,14 +236,38 @@ class PlatformBridge {
     return null;
   }
 
+  static String? _resolvedPersistentDirPath;
+
+  static String _getPersistentDirectoryPath() {
+    if (_resolvedPersistentDirPath != null) return _resolvedPersistentDirPath!;
+    final candidates = [
+      "/data/user/0/com.niooo.m.flutter_live_app/files",
+      "/data/data/com.niooo.m.flutter_live_app/files",
+      Directory.systemTemp.path,
+    ];
+    for (final path in candidates) {
+      try {
+        final dir = Directory(path);
+        if (!dir.existsSync()) {
+          dir.createSync(recursive: true);
+        }
+        if (dir.existsSync()) {
+          _resolvedPersistentDirPath = dir.path;
+          return dir.path;
+        }
+      } catch (_) {}
+    }
+    return Directory.systemTemp.path;
+  }
+
   static bool _diskCacheLoaded = false;
 
   static void _ensureDiskCacheLoaded() {
     if (_diskCacheLoaded) return;
     _diskCacheLoaded = true;
     try {
-      final cacheFile =
-          File("${Directory.systemTemp.path}/niooo_m_public_api_cache_v1.json");
+      final baseDir = _getPersistentDirectoryPath();
+      final cacheFile = File("$baseDir/niooo_m_persistent_store_v2.json");
       if (cacheFile.existsSync()) {
         final raw = cacheFile.readAsStringSync();
         if (raw.trim().startsWith("{")) {
@@ -258,8 +286,8 @@ class PlatformBridge {
 
   static void _flushDiskCache() {
     try {
-      final cacheFile =
-          File("${Directory.systemTemp.path}/niooo_m_public_api_cache_v1.json");
+      final baseDir = _getPersistentDirectoryPath();
+      final cacheFile = File("$baseDir/niooo_m_persistent_store_v2.json");
       cacheFile.writeAsStringSync(jsonEncode(_memoryStorage), flush: true);
     } catch (_) {}
   }
@@ -279,6 +307,16 @@ class PlatformBridge {
     _flushDiskCache();
   }
 
+  static bool localFileExists(String filePath) {
+    if (filePath.isEmpty) return false;
+    try {
+      final file = File(filePath);
+      return file.existsSync() && file.lengthSync() > 1024;
+    } catch (_) {
+      return false;
+    }
+  }
+
   static void copyToClipboard(String text) {
     Clipboard.setData(ClipboardData(text: text));
   }
@@ -289,6 +327,7 @@ class PlatformBridge {
     required String viewType,
     required String src,
     required String posterUrl,
+    double initialSeekSeconds = 0.0,
     required void Function(double duration) onDurationLoaded,
     required void Function() onPlay,
     required void Function() onPause,
@@ -298,19 +337,30 @@ class PlatformBridge {
       _nativePlayerChannel.invokeMethod("boostPlayback");
     } catch (_) {}
 
-    final controller = VideoPlayerController.networkUrl(
-      Uri.parse(src),
-      httpHeaders: const {
-        "User-Agent":
-            "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-        "Referer": "https://streamtape.com/",
-        "Connection": "keep-alive",
-      },
-      videoPlayerOptions: VideoPlayerOptions(
-        mixWithOthers: false,
-        allowBackgroundPlayback: false,
-      ),
-    );
+    final bool isLocalFile =
+        !src.startsWith("http://") && !src.startsWith("https://") && File(src).existsSync();
+
+    final VideoPlayerController controller = isLocalFile
+        ? VideoPlayerController.file(
+            File(src),
+            videoPlayerOptions: VideoPlayerOptions(
+              mixWithOthers: false,
+              allowBackgroundPlayback: false,
+            ),
+          )
+        : VideoPlayerController.networkUrl(
+            Uri.parse(src),
+            httpHeaders: const {
+              "User-Agent":
+                  "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+              "Referer": "https://streamtape.com/",
+              "Connection": "keep-alive",
+            },
+            videoPlayerOptions: VideoPlayerOptions(
+              mixWithOthers: false,
+              allowBackgroundPlayback: false,
+            ),
+          );
 
     bool lastPlayingState = false;
     controller.addListener(() {
@@ -327,14 +377,22 @@ class PlatformBridge {
       }
     });
 
-    controller.initialize().then((_) {
+    controller.initialize().then((_) async {
       final totalSecs =
           controller.value.duration.inMilliseconds.toDouble() / 1000.0;
       if (totalSecs > 0) {
         onDurationLoaded(totalSecs);
       }
+      if (initialSeekSeconds > 1.0 &&
+          (totalSecs <= 0 || initialSeekSeconds < totalSecs - 3.0)) {
+        try {
+          await controller.seekTo(
+            Duration(milliseconds: (initialSeekSeconds * 1000).round()),
+          );
+        } catch (_) {}
+      }
       setScreenWakelock(true);
-      controller.play();
+      await controller.play();
       onPlay();
     }).catchError((_) {});
 
@@ -343,6 +401,194 @@ class PlatformBridge {
 
   static const MethodChannel _nativePlayerChannel =
       MethodChannel("com.niooo.m/player");
+
+  static void showDownloadNotification({
+    required String movieId,
+    required String title,
+    required String body,
+    required int progress,
+    required bool isOngoing,
+  }) {
+    try {
+      _nativePlayerChannel.invokeMethod("showDownloadNotification", {
+        "id": movieId.hashCode.abs() % 100000 + 1000,
+        "title": title,
+        "body": body,
+        "progress": progress.clamp(0, 100),
+        "ongoing": isOngoing,
+      });
+    } catch (_) {}
+  }
+
+  static void cancelDownloadNotification(String movieId) {
+    try {
+      _nativePlayerChannel.invokeMethod("cancelDownloadNotification", {
+        "id": movieId.hashCode.abs() % 100000 + 1000,
+      });
+    } catch (_) {}
+  }
+
+  static Future<void> startRealVideoDownload({
+    required String movieId,
+    required String title,
+    required String targetFileOrUrl,
+    required int estimatedBytes,
+    required void Function(
+      int downloadedBytes,
+      int totalBytes,
+      String speedText,
+      String localPath,
+      String directUrl,
+    ) onProgress,
+    required void Function(String localPath, int totalBytes, String directUrl)
+        onCompleted,
+    required void Function(String errorMessage) onError,
+  }) async {
+    _cancelledDownloads.remove(movieId);
+
+    try {
+      final directUrl = await resolveBackgroundDirectMp4Url(targetFileOrUrl);
+      if (_cancelledDownloads[movieId] == true) return;
+
+      if (directUrl == null || !directUrl.startsWith("http")) {
+        showDownloadNotification(
+          movieId: movieId,
+          title: title,
+          body: "Download failed: Could not extract direct MP4 stream",
+          progress: 0,
+          isOngoing: false,
+        );
+        onError("Could not extract direct MP4 link. Please try again.");
+        return;
+      }
+
+      final baseDir = _getPersistentDirectoryPath();
+      final downloadsDir = Directory("$baseDir/offline_movies");
+      if (!downloadsDir.existsSync()) {
+        downloadsDir.createSync(recursive: true);
+      }
+
+      final safeId = movieId.replaceAll(RegExp(r"[^a-zA-Z0-9_-]"), "_");
+      final localFilePath = "${downloadsDir.path}/niooo_$safeId.mp4";
+      final outFile = File(localFilePath);
+
+      final client = _getFastHttpClient();
+      final req = await client.getUrl(Uri.parse(directUrl));
+      req.headers.set(
+        "User-Agent",
+        "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+      );
+      req.headers.set("Referer", "https://streamtape.com/");
+
+      final res = await req.close();
+      if (res.statusCode < 200 || res.statusCode >= 400) {
+        onError("Server returned HTTP ${res.statusCode}");
+        return;
+      }
+
+      final int totalBytes = res.contentLength > 0
+          ? res.contentLength
+          : (estimatedBytes > 0 ? estimatedBytes : 150 * 1024 * 1024);
+
+      final sink = outFile.openWrite();
+      int downloadedBytes = 0;
+      DateTime lastUiUpdate = DateTime.now();
+      int bytesAtLastUpdate = 0;
+
+      await for (final chunk in res) {
+        if (_cancelledDownloads[movieId] == true) {
+          await sink.close();
+          if (outFile.existsSync()) {
+            try {
+              outFile.deleteSync();
+            } catch (_) {}
+          }
+          cancelDownloadNotification(movieId);
+          return;
+        }
+
+        sink.add(chunk);
+        downloadedBytes += chunk.length;
+
+        final now = DateTime.now();
+        final elapsedMs = now.difference(lastUiUpdate).inMilliseconds;
+        if (elapsedMs >= 450) {
+          final deltaBytes = downloadedBytes - bytesAtLastUpdate;
+          final double bytesPerSec =
+              elapsedMs > 0 ? (deltaBytes * 1000.0 / elapsedMs) : 0.0;
+          final String speedLabel = bytesPerSec >= 1024 * 1024
+              ? "${(bytesPerSec / (1024 * 1024)).toStringAsFixed(1)} MB/s"
+              : "${(bytesPerSec / 1024).round()} KB/s";
+
+          final int pct = totalBytes > 0
+              ? ((downloadedBytes / totalBytes) * 100).round().clamp(1, 99)
+              : 50;
+
+          final dlMb = (downloadedBytes / (1024 * 1024)).toStringAsFixed(1);
+          final totMb = (totalBytes / (1024 * 1024)).toStringAsFixed(1);
+
+          showDownloadNotification(
+            movieId: movieId,
+            title: "Downloading: $title",
+            body: "$pct% · $dlMb MB / $totMb MB ($speedLabel)",
+            progress: pct,
+            isOngoing: true,
+          );
+
+          onProgress(
+            downloadedBytes,
+            totalBytes,
+            speedLabel,
+            localFilePath,
+            directUrl,
+          );
+
+          lastUiUpdate = now;
+          bytesAtLastUpdate = downloadedBytes;
+        }
+      }
+
+      await sink.flush();
+      await sink.close();
+
+      final finalBytes =
+          downloadedBytes > 0 ? downloadedBytes : totalBytes;
+      final totMb = (finalBytes / (1024 * 1024)).toStringAsFixed(1);
+
+      showDownloadNotification(
+        movieId: movieId,
+        title: "Download Complete: $title",
+        body: "Saved offline ($totMb MB) · Tap to watch in Niooo M",
+        progress: 100,
+        isOngoing: false,
+      );
+
+      onCompleted(localFilePath, finalBytes, directUrl);
+    } catch (e) {
+      if (_cancelledDownloads[movieId] == true) return;
+      showDownloadNotification(
+        movieId: movieId,
+        title: "Download Interrupted: $title",
+        body: "Open Niooo M Downloads Manager to retry",
+        progress: 0,
+        isOngoing: false,
+      );
+      onError(e.toString());
+    }
+  }
+
+  static void cancelVideoDownload(String movieId, {String? localFilePath}) {
+    _cancelledDownloads[movieId] = true;
+    cancelDownloadNotification(movieId);
+    if (localFilePath != null && localFilePath.isNotEmpty) {
+      try {
+        final f = File(localFilePath);
+        if (f.existsSync()) {
+          f.deleteSync();
+        }
+      } catch (_) {}
+    }
+  }
 
   static void setScreenWakelock(bool enable) {
     try {

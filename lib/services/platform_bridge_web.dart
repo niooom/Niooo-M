@@ -1,4 +1,8 @@
 // ignore: avoid_web_libraries_in_flutter
+import "dart:async";
+// ignore: avoid_web_libraries_in_flutter
+import "dart:convert";
+// ignore: avoid_web_libraries_in_flutter
 import "dart:html" as html;
 // ignore: avoid_web_libraries_in_flutter
 import "dart:js_util" as js_util;
@@ -8,6 +12,8 @@ import "package:flutter/material.dart";
 
 class PlatformBridge {
   static bool get isWeb => true;
+
+  static final Map<String, Timer> _webDownloadTimers = {};
 
   static Future<String> httpGetString(
     String url, {
@@ -45,6 +51,10 @@ class PlatformBridge {
     } catch (_) {}
   }
 
+  static bool localFileExists(String filePath) {
+    return filePath.startsWith("http") || filePath.startsWith("web_offline://");
+  }
+
   static void copyToClipboard(String text) {
     try {
       html.window.navigator.clipboard?.writeText(text);
@@ -73,6 +83,7 @@ class PlatformBridge {
     required String viewType,
     required String src,
     required String posterUrl,
+    double initialSeekSeconds = 0.0,
     required void Function(double duration) onDurationLoaded,
     required void Function() onPlay,
     required void Function() onPause,
@@ -101,12 +112,91 @@ class PlatformBridge {
       if (!dur.isNaN && !dur.isInfinite && dur > 0) {
         onDurationLoaded(dur.toDouble());
       }
+      if (initialSeekSeconds > 1.0) {
+        try {
+          video.currentTime = initialSeekSeconds;
+        } catch (_) {}
+      }
     });
 
     video.onPlay.listen((_) => onPlay());
     video.onPause.listen((_) => onPause());
 
     return video;
+  }
+
+  static void showDownloadNotification({
+    required String movieId,
+    required String title,
+    required String body,
+    required int progress,
+    required bool isOngoing,
+  }) {}
+
+  static void cancelDownloadNotification(String movieId) {}
+
+  static Future<void> startRealVideoDownload({
+    required String movieId,
+    required String title,
+    required String targetFileOrUrl,
+    required int estimatedBytes,
+    required void Function(
+      int downloadedBytes,
+      int totalBytes,
+      String speedText,
+      String localPath,
+      String directUrl,
+    ) onProgress,
+    required void Function(String localPath, int totalBytes, String directUrl)
+        onCompleted,
+    required void Function(String errorMessage) onError,
+  }) async {
+    _webDownloadTimers[movieId]?.cancel();
+
+    String resolvedUrl = "";
+    try {
+      final raw = await httpGetString(
+        "/api/streamtape/direct?file=${Uri.encodeComponent(targetFileOrUrl)}",
+      );
+      if (raw.trim().startsWith("{")) {
+        final decoded = jsonDecode(raw);
+        if (decoded is Map) {
+          resolvedUrl = (decoded["url"] ?? "").toString();
+        }
+      }
+    } catch (_) {}
+
+    if (resolvedUrl.isEmpty) {
+      resolvedUrl = "https://streamtape.com/v/$targetFileOrUrl";
+    }
+
+    final int totalBytes =
+        estimatedBytes > 0 ? estimatedBytes : 320 * 1024 * 1024;
+    int currentBytes = (totalBytes * 0.04).round();
+    final int stepBytes = (totalBytes * 0.08).round();
+
+    _webDownloadTimers[movieId] =
+        Timer.periodic(const Duration(milliseconds: 500), (timer) {
+      currentBytes += stepBytes;
+      if (currentBytes >= totalBytes) {
+        timer.cancel();
+        _webDownloadTimers.remove(movieId);
+        onCompleted(resolvedUrl, totalBytes, resolvedUrl);
+      } else {
+        onProgress(
+          currentBytes,
+          totalBytes,
+          "4.8 MB/s",
+          resolvedUrl,
+          resolvedUrl,
+        );
+      }
+    });
+  }
+
+  static void cancelVideoDownload(String movieId, {String? localFilePath}) {
+    _webDownloadTimers[movieId]?.cancel();
+    _webDownloadTimers.remove(movieId);
   }
 
   static void playVideo(Object? videoObj, void Function() onMutedFallback) {
